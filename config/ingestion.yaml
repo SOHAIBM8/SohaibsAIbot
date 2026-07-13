@@ -1,0 +1,28 @@
+backfill:
+  # How far back to backfill when the exchange can't tell us its
+  # earliest available candle for a symbol. Configurable fallback per
+  # decision #3 in the ingestion spec — never a hardcoded start date.
+  default_backfill_years: 5
+  per_request_candle_limit: 1000
+
+gap_repair:
+  # Bounded retries per decision #4: a permanent hole in exchange
+  # history shouldn't retry forever.
+  max_attempts: 3
+  retry_interval_hours: 24
+
+incremental:
+  # Polling cadence per timeframe, in seconds. 1m polled far more often
+  # than 1d, per spec 4.6 — cadence is config, not per-service logic.
+  polling_seconds:
+    1m: 60
+    5m: 300
+    15m: 900
+    1h: 3600
+    4h: 14400
+    1d: 86400
+
+data_quality:
+  volume_anomaly_zscore_threshold: 4.0
+  # Minimum severity that triggers a DataQualityIssueFound event.
+  issue_severity_threshold: warning

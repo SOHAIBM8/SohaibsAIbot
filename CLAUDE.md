@@ -48,6 +48,19 @@ so Claude Code can continue that work without needing that conversation.
 - **Postgres from day one** for metadata/experiments/strategy versions
   (`schema.sql`). Parquet for historical OHLCV/feature data at backtest
   scale. No SQLite, no Supabase.
+- **TimescaleDB enabled on `raw_ohlcv` from day one**, not deferred —
+  see `docs/historical_data_ingestion_spec.md` decision #1. Hypertable
+  partitioned on `open_time`, 7-day chunks, compression after 30 days,
+  a `raw_ohlcv_daily` continuous aggregate. `docker-compose.yml` runs
+  `timescale/timescaledb:latest-pg16`, not plain `postgres:16`.
+- **Ingestion event bus is Postgres LISTEN/NOTIFY behind an `EventBus`
+  interface** (`core/ingestion/event_bus.py`), swappable for Kafka/
+  Redis Streams/NATS later without touching publishers or subscribers.
+- **Every ingestion service is idempotent and every run is logged.**
+  Closed candles are immutable (`ON CONFLICT DO NOTHING`, never
+  overwritten); every backfill/incremental/gap-repair/data-quality
+  invocation writes exactly one `ingestion_run_log` row, including
+  no-op runs — nothing is fire-and-forget.
 - **Signals execute at the NEXT bar's open, never the signal bar's own
   close.** A strategy decides using bar T's completed data, but can only
   act starting at bar T+1 — filling at bar T's close assumes zero-latency
@@ -84,11 +97,45 @@ risk discipline come first.
   not mocks.
 - `core/db.py`, `core/logging_config.py` — infra plumbing
 - `strategies/ema_cross.py`, `strategies/rsi_mean_reversion.py` — reference strategies
-- `schema.sql` — Postgres schema
-- Full test suite in `tests/` — 68 tests passing as of last run
+- `schema.sql` — Postgres schema, now including the TimescaleDB `raw_ohlcv`
+  hypertable and the ingestion tables (see below)
+- **Historical data ingestion** (`core/ingestion/`,
+  `docs/historical_data_ingestion_spec.md`) — Binance backfill,
+  incremental updates, gap detection/repair, and nightly data quality
+  auditing, all tested end-to-end against real Postgres and (via a
+  manual smoke test) real Binance data:
+  - `exchange_adapter.py` (`ExchangeAdapter` interface) +
+    `binance_adapter.py` (`BinanceAdapter`) + `testing.py`
+    (`FakeExchangeAdapter`/`AlwaysFatalAdapter` test doubles)
+  - `rate_limiter.py`, `retry_policy.py` — per-exchange rate limiting,
+    exponential backoff with jitter, retryable-vs-fatal error taxonomy
+    (`errors.py`)
+  - `candle_validator.py` — pure OHLC/alignment/closed-candle validation,
+    shared by ingestion-time and after-the-fact (data quality) checks
+  - `backfill_service.py`, `incremental_update_service.py` — idempotent
+    by construction (`ON CONFLICT DO NOTHING`); a completed backfill or
+    an up-to-date incremental run is a logged no-op, not a re-fetch
+  - `gap_detection_service.py`, `gap_repair_service.py` — bounded gap
+    repair (max 3 attempts, ≥24h apart, then `confirmed_absent` —
+    terminal, never re-flagged)
+  - `event_bus.py` (`EventBus` interface, `PostgresEventBus` via
+    LISTEN/NOTIFY), `events.py`
+  - `data_quality_service.py` — duplicates, invalid OHLC, timestamp
+    alignment, volume anomalies, and a live cross-check against the
+    exchange, each reported independently
+  - `scheduler.py` — in-process sweep coordinating all of the above per
+    tracked instrument (no Airflow/Prefect at this stage)
+  - `observability.py` — `/health` and `/metrics` (Prometheus text
+    format) HTTP endpoints; metric names are a stable interface
+  - `config.py` + `config/ingestion.yaml` — backfill window, gap-repair
+    attempts/spacing, per-timeframe polling cadence, all config not code
+  - `scripts/smoke_test_ingestion.py` — manual, not part of pytest;
+    runs the full pipeline against real Binance + real Postgres, cleans
+    up after itself
+- Full test suite in `tests/` — 124 tests passing as of last run (68 prior +
+  56 in `tests/ingestion/`, all against real local Postgres, no mocks)
 
 ## What's NOT built yet (next up)
-- Historical data ingestion (raw OHLCV from Binance)
 - Risk engine (real portfolio-level exposure limits, replacing `FixedFractionSizer`)
 - Execution layer (real exchange connectivity — Binance first, Kraken/Coinbase for US-user coverage)
 - SaaS layer — all later phases

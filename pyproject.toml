@@ -10,6 +10,8 @@ dependencies = [
     "structlog>=24.1",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
+    "requests>=2.31",
+    "prometheus-client>=0.20",
 ]
 
 [project.optional-dependencies]
@@ -20,6 +22,9 @@ dev = [
     "black>=24.0",
     "mypy>=1.10",
 ]
+
+[tool.setuptools.packages.find]
+include = ["core*", "strategies*"]
 
 [tool.ruff]
 line-length = 100

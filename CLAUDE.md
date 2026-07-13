@@ -48,6 +48,11 @@ so Claude Code can continue that work without needing that conversation.
 - **Postgres from day one** for metadata/experiments/strategy versions
   (`schema.sql`). Parquet for historical OHLCV/feature data at backtest
   scale. No SQLite, no Supabase.
+- **Signals execute at the NEXT bar's open, never the signal bar's own
+  close.** A strategy decides using bar T's completed data, but can only
+  act starting at bar T+1 — filling at bar T's close assumes zero-latency
+  execution. `core/backtest_engine.py` queues entries and fills them one
+  bar later. Don't "simplify" this back to same-bar fills.
 - **Risk engine (not yet built) has final authority** over position size
   and stops — a strategy's `entry_price`/`stop_loss`/`take_profit` are
   proposals, not orders.
@@ -67,19 +72,24 @@ risk discipline come first.
 - `core/feature_store.py` — `FeatureRegistry`, `FeatureWindow`, dependency resolution
 - `core/indicators/` — `pandas_ta_adapter.py` (library wrap), `derived.py` (hand-written), `register.py` (default registry)
 - `core/regime_detector.py` + `core/regime_config.py` — rule-based trend/vol regime detection with hysteresis
+- `core/execution_model.py` — fee + slippage simulation
+- `core/position_sizing.py` — `PositionSizer` interface + `FixedFractionSizer` (Risk Engine stand-in)
+- `core/portfolio.py` — cash/position/trade tracking, long & short
+- `core/backtest_engine.py` — event-driven loop, next-bar-open execution, warmup handling, multi-strategy
+- `core/metrics.py` — win rate, profit factor, Sharpe, Sortino, max drawdown, CAGR, expectancy, avg R multiple, exposure
+- `core/walk_forward.py` — sequential window splitting and per-window evaluation
 - `core/experiment.py` — experiment tracking (stubs; not yet wired to Postgres)
 - `core/db.py`, `core/logging_config.py` — infra plumbing
 - `strategies/ema_cross.py`, `strategies/rsi_mean_reversion.py` — reference strategies
 - `schema.sql` — Postgres schema
-- Full test suite in `tests/` — 24 tests passing as of last run
+- Full test suite in `tests/` — 62 tests passing as of last run
 
 ## What's NOT built yet (next up)
-- `BacktestEngine` — the actual event-driven loop tying regime detector +
-  strategy registry + confidence engine together over historical data
-  (sketched in prose in earlier design discussion, not yet code)
 - Real Postgres wiring for `ExperimentTracker` (currently stubs)
 - Historical data ingestion (raw OHLCV from Binance)
-- Risk engine, execution layer, SaaS layer — all later phases
+- Risk engine (real portfolio-level exposure limits, replacing `FixedFractionSizer`)
+- Execution layer (real exchange connectivity — Binance first, Kraken/Coinbase for US-user coverage)
+- SaaS layer — all later phases
 
 ## Commands
 ```bash

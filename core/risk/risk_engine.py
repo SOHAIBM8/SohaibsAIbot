@@ -357,7 +357,7 @@ class RiskEngine(PositionSizer):
         return decision
 
     def _log_decision(self, signal: Signal, context: RiskContext, decision: SizingDecision) -> None:
-        self.db.execute(
+        result = self.db.execute(
             text("""
                 INSERT INTO risk_decision_log (
                     experiment_id, bar_time, strategy_id, proposed_quantity, approved_quantity,
@@ -366,6 +366,7 @@ class RiskEngine(PositionSizer):
                     :experiment_id, :bar_time, :strategy_id, :proposed_quantity, :approved_quantity,
                     :rejection_reason, :throttle_reasons, :layer_results, :risk_config_id
                 )
+                RETURNING id
                 """),
             {
                 "experiment_id": self.experiment_id,
@@ -381,4 +382,5 @@ class RiskEngine(PositionSizer):
                 "risk_config_id": self.config.risk_config_id,
             },
         )
+        decision.risk_decision_id = result.scalar_one()
         self.db.commit()

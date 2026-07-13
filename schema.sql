@@ -304,3 +304,58 @@ CREATE TABLE data_quality_report (
 );
 
 CREATE INDEX idx_data_quality_report_instrument ON data_quality_report (exchange, symbol, timeframe, run_at DESC);
+
+-- =====================================================================
+-- Live Execution & Paper Trading, Stage 1 (docs/execution_engine_stage1_spec.md)
+-- Stage 1 only: paper trading + shared order state machine + read-only
+-- market data. No balances/reconciliation/external-trade tables —
+-- those are meaningless without a real exchange connection and belong
+-- to Stage 2/3.
+-- =====================================================================
+
+-- Step 1: orders/fills.
+CREATE TABLE orders (
+    client_order_id     TEXT PRIMARY KEY,
+    exchange_order_id   TEXT,                -- null until Stage 2
+    strategy_id         TEXT NOT NULL,
+    symbol              TEXT NOT NULL,
+    order_type          TEXT NOT NULL,
+    direction           SMALLINT NOT NULL,
+    quantity            NUMERIC NOT NULL,
+    limit_price         NUMERIC,
+    stop_price          NUMERIC,
+    mode                TEXT NOT NULL,       -- 'paper' | 'live'
+    state               TEXT NOT NULL,
+    risk_decision_id    BIGINT NOT NULL REFERENCES risk_decision_log(id),
+    created_at          TIMESTAMPTZ NOT NULL,
+    updated_at          TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE fills (
+    id                  BIGSERIAL PRIMARY KEY,
+    client_order_id     TEXT NOT NULL REFERENCES orders(client_order_id),
+    fill_price          NUMERIC NOT NULL,
+    quantity            NUMERIC NOT NULL,
+    fee                 NUMERIC NOT NULL,
+    is_partial          BOOLEAN NOT NULL,
+    filled_at           TIMESTAMPTZ NOT NULL
+);
+
+-- Step 3: paper account balance tracking. Table only for now — the
+-- actual balance-update logic lives in OrderManager.handle_fill()
+-- (step 4), since that's the one place a fill's effect on an account
+-- is known.
+CREATE TABLE paper_accounts (
+    account_id          TEXT PRIMARY KEY,
+    starting_balance     NUMERIC NOT NULL,
+    current_cash          NUMERIC NOT NULL,
+    created_at             TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE account_snapshots (
+    id                  BIGSERIAL PRIMARY KEY,
+    account_id            TEXT NOT NULL REFERENCES paper_accounts(account_id),
+    equity                  NUMERIC NOT NULL,
+    open_position_count       INT NOT NULL,
+    snapshot_at                 TIMESTAMPTZ NOT NULL
+);

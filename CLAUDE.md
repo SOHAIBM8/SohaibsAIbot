@@ -86,12 +86,27 @@ so Claude Code can continue that work without needing that conversation.
 - **Binance for development**, but the exchange abstraction must support
   Kraken/Coinbase early — Binance.com is unavailable to US users, and this
   is headed toward a multi-user SaaS.
+- **Live Execution & Paper Trading ships in three stages; only Stage 1
+  is built.** `OrderManager` and the order state machine are IDENTICAL
+  for paper and live — only `ExecutionAdapter` differs, so Stage 2
+  (real exchange order placement) plugs in without touching
+  `OrderManager`. Stage 1 has ZERO exchange authentication and ZERO
+  real order placement — `LiveExecutionAdapter` is an interface stub
+  only, every method raises `NotImplementedError`. **Stage 2 (real
+  exchange adapters) and Stage 3 (live trading enablement, API key
+  custody) are separate, not-yet-specced phases** — do not treat
+  Stage 1 as "the execution layer is done." Every order, paper or
+  live, must originate from an approved `SizingDecision` — no code
+  path places an order without Risk Engine approval.
 
 ## Build order (don't skip ahead)
 Foundations → backtesting engine → execution layer → risk engine → SaaS
 multi-tenancy → AI signal research. AI is deliberately last — infra and
-risk discipline come first. Risk engine is now built; execution layer
-is next.
+risk discipline come first. Risk engine is built. Execution layer
+Stage 1 (paper trading + shared order state machine + read-only market
+data) is built; Stage 2 (real exchange order placement) and Stage 3
+(live trading enablement, API key custody) are NOT started and need
+their own specs before any work begins on them.
 
 ## What's built so far
 - `core/strategy_base.py` — `Signal`, `StrategyMeta`, `StrategyBase`, `Regime`, `VolRegime`
@@ -193,12 +208,69 @@ is next.
     is unimplemented (spec gives no N/window); the "hard per-trade cap"
     reuses `max_same_symbol_directional_exposure_pct` (no dedicated
     config field exists for it)
-- Full test suite in `tests/` — 231 tests passing as of last run (124 prior +
-  105 in `tests/test_risk/` + 2 more in `test_experiment.py` for
-  `risk_config_id`, all against real local Postgres, no mocks)
+- **Live Execution & Paper Trading — Stage 1 only** (`core/execution/`,
+  `core/marketdata/`, `docs/execution_engine_stage1_spec.md`). Real
+  exchange order placement (Stage 2) and live trading enablement/API
+  key custody (Stage 3) are explicitly NOT built — see the decision
+  above. What Stage 1 covers, tested end-to-end against real Postgres
+  and a real local WebSocket server (not mocks):
+  - `core/execution/order.py` — `OrderState`, `OrderType`, `Order`
+    (`transition_to()` is the single choke point for every state
+    change), `Fill`; an explicit legal-transition table, exhaustively
+    tested over the full state × state cross product
+  - `core/execution/execution_adapter.py` — `ExecutionAdapter` interface
+    (`submit_order`/`cancel_order`/`get_order_status`/`get_fills`)
+  - `core/execution/live_execution_adapter.py` — `LiveExecutionAdapter`,
+    a Stage 2 stub; every method raises `NotImplementedError`
+  - `core/execution/latency_simulator.py`, `fill_simulator.py` —
+    configurable fixed+jittered latency; fills reuse the *existing*
+    `ExecutionModel`, no second fee/slippage model
+  - `core/execution/paper_execution_adapter.py` — `PaperExecutionAdapter`,
+    Stage 1's concrete adapter; fills synchronously (no real order book
+    yet), idempotent on `client_order_id`. Only transitions orders to
+    `SUBMITTED` — `OrderManager.handle_fill()` owns every fill-driven
+    transition, identically for paper and live
+  - `core/execution/order_manager.py` — `OrderManager`: `submit()`
+    (rejects any `SizingDecision` with `approved_quantity <= 0`, never
+    silently no-ops), `handle_fill()`, `cancel()`; updates
+    `paper_accounts.current_cash` per fill (no position tracking yet —
+    Stage 1's schema has no `positions` table)
+  - `core/execution/events.py` — `OrderSubmitted`, `OrderFilled`,
+    `OrderRejected`, `OrderCancelled`, `PaperFillSimulated`
+  - `core/marketdata/websocket_connection.py` — `WebSocketConnection`:
+    exponential backoff + jitter reconnect, heartbeat-timeout-triggered
+    reconnect, background-thread/synchronous-API shape (same pattern as
+    `PostgresEventBus`)
+  - `core/marketdata/market_data_normalizer.py` — `MarketDataNormalizer`/
+    `NormalizedTick`; raises on any malformed field, never defaults
+  - `core/marketdata/live_market_data_source.py` — `LiveMarketDataSource`,
+    the first real `MarketDataSource` implementation; `PaperExecutionAdapter`
+    needed zero changes to consume it, since it was already written
+    against that Protocol
+  - `core/risk/risk_decision.py` — `SizingDecision` gained
+    `risk_decision_id`, and `RiskEngine._log_decision()` now captures it
+    via `RETURNING id` — closes the gap flagged in the Risk Engine's
+    step 2, needed because `Order.risk_decision_id` is a required FK
+  - `core/ingestion/event_bus.py` — `EventBus.publish()` generalized to
+    accept any `EventLike`-shaped object (a `Protocol`), not just
+    `IngestionEvent` — the risk and execution components now publish on
+    the same bus
+  - Known, deliberate gaps (see `core/execution/order_manager.py` and
+    `core/execution/paper_execution_adapter.py` module docstrings):
+    `OrderManager`'s constructor takes `mode`/`account_id`/
+    `starting_balance` beyond the spec's literal 3 params — nothing
+    else could supply them; no `account_snapshots` writing logic yet
+    (nothing in Stage 1's spec assigns that responsibility to any
+    class)
+- Full test suite in `tests/` — 345 tests passing as of last run (231 prior +
+  114 across `tests/test_execution/` and `tests/test_marketdata/`, all
+  against real local Postgres and/or a real local WebSocket server, no
+  mocks)
 
 ## What's NOT built yet (next up)
-- Execution layer (real exchange connectivity — Binance first, Kraken/Coinbase for US-user coverage)
+- Execution layer Stage 2 (real exchange order placement — Binance
+  first, Kraken/Coinbase for US-user coverage) and Stage 3 (live
+  trading enablement, API key custody) — both need their own specs
 - SaaS layer — all later phases
 
 ## Commands

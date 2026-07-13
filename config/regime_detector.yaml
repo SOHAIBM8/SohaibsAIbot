@@ -1,0 +1,21 @@
+trend:
+  # ADX below this is considered "no real trend" regardless of EMA
+  # order — 20 is the conventional trending/ranging cutoff. Treat as a
+  # starting point to validate empirically via the experiment tracker,
+  # not a settled fact.
+  adx_threshold: 20.0
+
+volatility:
+  # Bars used to build the trailing ATR distribution ATR is ranked
+  # against. NOTE: this is timeframe-dependent — 90 bars is ~3 days on
+  # a 1h chart but ~3 months on a 1d chart. Set deliberately per
+  # timeframe, don't leave the default unexamined.
+  lookback_bars: 90
+  high_percentile: 0.70
+  low_percentile: 0.30
+
+hysteresis:
+  # Consecutive bars a new raw classification must hold before the
+  # confirmed regime actually switches. Higher = more stable, slower
+  # to react. Lower = more responsive, more prone to flapping.
+  min_confirmation_bars: 3

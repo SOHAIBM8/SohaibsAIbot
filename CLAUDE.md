@@ -78,14 +78,16 @@ risk discipline come first.
 - `core/backtest_engine.py` — event-driven loop, next-bar-open execution, warmup handling, multi-strategy
 - `core/metrics.py` — win rate, profit factor, Sharpe, Sortino, max drawdown, CAGR, expectancy, avg R multiple, exposure
 - `core/walk_forward.py` — sequential window splitting and per-window evaluation
-- `core/experiment.py` — experiment tracking (stubs; not yet wired to Postgres)
+- `core/experiment.py` — `ExperimentTracker` (`start`/`finish`/`compare`) wired to real
+  Postgres via `core/db.py`'s `SessionLocal`; `ComparisonTable` for side-by-side results.
+  Tested against a live local Postgres (`docker compose up -d` + `schema.sql` applied),
+  not mocks.
 - `core/db.py`, `core/logging_config.py` — infra plumbing
 - `strategies/ema_cross.py`, `strategies/rsi_mean_reversion.py` — reference strategies
 - `schema.sql` — Postgres schema
-- Full test suite in `tests/` — 62 tests passing as of last run
+- Full test suite in `tests/` — 68 tests passing as of last run
 
 ## What's NOT built yet (next up)
-- Real Postgres wiring for `ExperimentTracker` (currently stubs)
 - Historical data ingestion (raw OHLCV from Binance)
 - Risk engine (real portfolio-level exposure limits, replacing `FixedFractionSizer`)
 - Execution layer (real exchange connectivity — Binance first, Kraken/Coinbase for US-user coverage)

@@ -1,0 +1,43 @@
+risk_config_id: default
+version: "1.0.0"
+
+loss_limits:
+  # Realized+unrealized PnL, evaluated over the UTC calendar day/week
+  # (decision #1) — never held-position-relative or rolling windows.
+  daily_loss_limit_pct: 0.03
+  weekly_loss_limit_pct: 0.08
+
+drawdown:
+  # Tiered response against running peak equity. Tier 1 throttles new
+  # size, tier 2 stops new entries outright, tier 3 is the auto
+  # kill-switch trigger. Existing positions are never force-closed by
+  # any tier alone — see kill_switch.auto_flatten below.
+  tier_1_pct: 0.10
+  tier_1_factor: 0.5
+  tier_2_pct: 0.15
+  tier_3_pct: 0.25
+
+exposure:
+  max_gross_exposure_pct: 1.0
+  max_net_exposure_pct: 0.5
+  max_concurrent_positions: 5
+  # Phase A correlation control: two strategies long the same symbol
+  # count against this ONE figure, not as independent bets.
+  max_same_symbol_directional_exposure_pct: 0.2
+
+sizing:
+  method: fixed_fraction  # 'fixed_fraction' | 'volatility_adjusted' | 'fractional_kelly'
+  kelly_fraction_multiplier: 0.5
+  # Same minimum-sample-size philosophy as ConfidenceEngine — never
+  # size off Kelly with thin historical data.
+  kelly_min_sample_size: 30
+
+circuit_breaker:
+  atr_percentile_threshold: 0.95
+  confirmation_bars: 3
+
+kill_switch:
+  # Default = block new trades only; existing positions keep being
+  # monitored and their stops/targets keep being tracked (decision #2).
+  # Auto-flatten is opt-in and off by default.
+  auto_flatten: false

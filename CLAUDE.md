@@ -66,9 +66,23 @@ so Claude Code can continue that work without needing that conversation.
   act starting at bar T+1 — filling at bar T's close assumes zero-latency
   execution. `core/backtest_engine.py` queues entries and fills them one
   bar later. Don't "simplify" this back to same-bar fills.
-- **Risk engine (not yet built) has final authority** over position size
-  and stops — a strategy's `entry_price`/`stop_loss`/`take_profit` are
-  proposals, not orders.
+- **Risk engine has final authority** over position size and stops — a
+  strategy's `entry_price`/`stop_loss`/`take_profit` are proposals, not
+  orders. `PositionSizer.size()` takes a `RiskContext` (equity, feature
+  window, regime state, a read-only `PortfolioView`, data-quality
+  status, timestamp) and returns a `SizingDecision` (approved quantity
+  + full per-layer audit trail), not a bare float — a breaking change
+  from the original stub, made deliberately (see
+  `docs/risk_engine_spec.md` section 2).
+- **Kill switch state is persisted to Postgres**, never held only in
+  memory — a process restart must never silently clear an emergency
+  stop. It never auto-clears; `engage()`/`disengage()` are both
+  explicit. Circuit breakers are in-memory per process (auto-recovering
+  by nature) but every trip/clear transition is still logged for audit.
+- **Correlation management ships in two phases.** Phase A (built) tracks
+  net directional exposure across strategies on the *same* symbol —
+  real pairwise correlation across *different* symbols (Phase B) waits
+  for multi-symbol execution to actually exist.
 - **Binance for development**, but the exchange abstraction must support
   Kraken/Coinbase early — Binance.com is unavailable to US users, and this
   is headed toward a multi-user SaaS.
@@ -76,7 +90,8 @@ so Claude Code can continue that work without needing that conversation.
 ## Build order (don't skip ahead)
 Foundations → backtesting engine → execution layer → risk engine → SaaS
 multi-tenancy → AI signal research. AI is deliberately last — infra and
-risk discipline come first.
+risk discipline come first. Risk engine is now built; execution layer
+is next.
 
 ## What's built so far
 - `core/strategy_base.py` — `Signal`, `StrategyMeta`, `StrategyBase`, `Regime`, `VolRegime`
@@ -86,9 +101,15 @@ risk discipline come first.
 - `core/indicators/` — `pandas_ta_adapter.py` (library wrap), `derived.py` (hand-written), `register.py` (default registry)
 - `core/regime_detector.py` + `core/regime_config.py` — rule-based trend/vol regime detection with hysteresis
 - `core/execution_model.py` — fee + slippage simulation
-- `core/position_sizing.py` — `PositionSizer` interface + `FixedFractionSizer` (Risk Engine stand-in)
-- `core/portfolio.py` — cash/position/trade tracking, long & short
-- `core/backtest_engine.py` — event-driven loop, next-bar-open execution, warmup handling, multi-strategy
+- `core/position_sizing.py` — `PositionSizer` interface (`size(signal, RiskContext) ->
+  SizingDecision`) + `FixedFractionSizer`, the deliberately naive baseline sizer
+- `core/portfolio.py` — cash/position/trade tracking, long & short, plus
+  `PositionView`/`PortfolioView`/`Portfolio.snapshot()` — the Risk Engine's only
+  read-only window into portfolio state
+- `core/backtest_engine.py` — event-driven loop, next-bar-open execution, warmup
+  handling, multi-strategy; builds a `RiskContext` per queued entry and calls the
+  widened `PositionSizer` interface (incidentally fixed a latent bug: sizing now
+  uses portfolio *equity*, not raw cash)
 - `core/metrics.py` — win rate, profit factor, Sharpe, Sortino, max drawdown, CAGR, expectancy, avg R multiple, exposure
 - `core/walk_forward.py` — sequential window splitting and per-window evaluation
 - `core/experiment.py` — `ExperimentTracker` (`start`/`finish`/`compare`) wired to real
@@ -132,11 +153,51 @@ risk discipline come first.
   - `scripts/smoke_test_ingestion.py` — manual, not part of pytest;
     runs the full pipeline against real Binance + real Postgres, cleans
     up after itself
-- Full test suite in `tests/` — 124 tests passing as of last run (68 prior +
-  56 in `tests/ingestion/`, all against real local Postgres, no mocks)
+- **Risk engine** (`core/risk/`, `docs/risk_engine_spec.md`) — replaces
+  `FixedFractionSizer`-as-Risk-Engine-stand-in with real portfolio-level
+  risk management, tested end-to-end against real Postgres:
+  - `rejection_reason.py` — `RejectionReason` (11 values)/`ThrottleReason`
+    (3 values) enums; every rejection carries an exact value, never free text
+  - `risk_context.py`, `risk_decision.py` — `RiskContext` (input),
+    `SizingDecision`/`LayerResult` (output)
+  - `risk_config.py` + `config/risk_engine.yaml` — versioned risk
+    parameters (`risk_config` table); `ExperimentConfig.risk_config_id`
+    now versions risk params across experiments like strategy versions
+  - `kill_switch.py` — `KillSwitch`, Postgres-persisted, restart-survival
+    tested; never auto-clears
+  - `circuit_breaker.py` — `CircuitBreaker`, asymmetric hysteresis
+    (immediate trip, N-confirmed clear); pure in-memory by design, with a
+    standalone `record_circuit_breaker_event()` for the caller to persist
+    transitions (`circuit_breaker_event_log`)
+  - `loss_limit_tracker.py` — UTC daily/weekly realized+unrealized PnL vs.
+    limits, boundary-tested at the exact UTC midnight/Monday transition
+  - `drawdown_monitor.py` — tiered response (0 normal / 1 throttle / 2 hard
+    stop / 3 kill-switch-triggering) off running peak equity
+  - `exposure_tracker.py` — Phase A same-symbol directional exposure
+    (gross/net/concurrent-position/same-direction-concentration limits)
+  - `position_sizing_strategies.py` — `PositionSizingStrategy` interface
+    (internal to RiskEngine) + `VolatilityAdjustedSizer` +
+    `FractionalKellySizer` (fractional Kelly, sample-size-gated,
+    never guesses with thin data)
+  - `risk_engine.py` — `RiskEngine(PositionSizer)`, the five-layer
+    fail-fast pipeline (gate → budget → portfolio → sizing → decision),
+    logs every decision to `risk_decision_log`, publishes events on the
+    (now domain-agnostic) `EventBus` from the ingestion component
+  - `events.py` — `RiskDecisionMade`, `CircuitBreakerTripped/Cleared`,
+    `KillSwitchEngaged/Disengaged`, `DailyLossLimitBreached`,
+    `DrawdownTierChanged`
+  - Known, deliberate gaps (see `core/risk/risk_engine.py` module
+    docstring for full rationale): circuit breakers all read
+    `atr_percentile_90` (RiskConfig only configures one breaker
+    dimension); the "N circuit breaker trips" kill-switch auto-trigger
+    is unimplemented (spec gives no N/window); the "hard per-trade cap"
+    reuses `max_same_symbol_directional_exposure_pct` (no dedicated
+    config field exists for it)
+- Full test suite in `tests/` — 231 tests passing as of last run (124 prior +
+  105 in `tests/test_risk/` + 2 more in `test_experiment.py` for
+  `risk_config_id`, all against real local Postgres, no mocks)
 
 ## What's NOT built yet (next up)
-- Risk engine (real portfolio-level exposure limits, replacing `FixedFractionSizer`)
 - Execution layer (real exchange connectivity — Binance first, Kraken/Coinbase for US-user coverage)
 - SaaS layer — all later phases
 

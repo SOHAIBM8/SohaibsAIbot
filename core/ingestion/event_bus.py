@@ -5,6 +5,19 @@ transport later without any publisher or subscriber code changing —
 that's the entire point of depending on EventBus, not PostgresEventBus,
 everywhere else in the ingestion component.
 
+Design note (rule 9, generalized while wiring up docs/risk_engine_spec.md):
+`publish()` originally accepted only `IngestionEvent`. The Risk Engine
+(core/risk/risk_engine.py) needs the SAME bus/transport for its own
+events (RiskDecisionMade, KillSwitchEngaged, ...), which have nothing
+to do with ingestion. `PostgresEventBus.publish()` only ever touches
+`event.event_type` and `event.to_dict()` — it never actually depended
+on IngestionEvent specifically, just its shape. Loosening the type hint
+to the structural `EventLike` Protocol below makes that already-true
+fact explicit, with zero behavior change and no change needed to any
+existing IngestionEvent subclass (dataclasses satisfy a Protocol
+structurally, not by inheritance). This is exactly the kind of reuse
+the interface's own docstring says it exists for.
+
 Design note: core/db.py's docstring says "no other module should
 construct a connection string or import psycopg2 directly" — LISTEN/
 NOTIFY is the one exception that needs a raw, autocommit DBAPI
@@ -21,21 +34,27 @@ import threading
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Protocol
 
 import structlog
 
 from core.db import engine
-from core.ingestion.events import IngestionEvent
 
 logger = structlog.get_logger(__name__)
 
 EventHandler = Callable[[dict], None]
 
 
+class EventLike(Protocol):
+    @property
+    def event_type(self) -> str: ...
+
+    def to_dict(self) -> dict: ...
+
+
 class EventBus(ABC):
     @abstractmethod
-    def publish(self, event: IngestionEvent) -> None: ...
+    def publish(self, event: EventLike) -> None: ...
 
     @abstractmethod
     def subscribe(self, event_type: str, handler: EventHandler) -> None: ...
@@ -54,7 +73,7 @@ class PostgresEventBus(EventBus):
         self._stop = threading.Event()
         self._started = False
 
-    def publish(self, event: IngestionEvent) -> None:
+    def publish(self, event: EventLike) -> None:
         raw = engine.raw_connection()
         try:
             dbapi_conn: Any = raw.driver_connection

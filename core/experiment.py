@@ -42,6 +42,8 @@ class ExperimentConfig:
     slippage_model: str
     code_commit_hash: str  # git commit at run time — non-negotiable
     # for being able to reproduce a result
+    risk_config_id: str | None = None  # versions risk parameters across
+    # experiments exactly like strategy_ids already does (docs/risk_engine_spec.md)
 
 
 @dataclass
@@ -107,11 +109,11 @@ class ExperimentTracker:
                 INSERT INTO experiments (
                     strategy_ids, symbol, timeframe, date_start, date_end,
                     feature_pipeline_version, fee_bps, slippage_model,
-                    code_commit_hash, started_at
+                    code_commit_hash, started_at, risk_config_id
                 ) VALUES (
                     :strategy_ids, :symbol, :timeframe, :date_start, :date_end,
                     :feature_pipeline_version, :fee_bps, :slippage_model,
-                    :code_commit_hash, :started_at
+                    :code_commit_hash, :started_at, :risk_config_id
                 )
                 RETURNING experiment_id
                 """),
@@ -126,6 +128,7 @@ class ExperimentTracker:
                 "slippage_model": config.slippage_model,
                 "code_commit_hash": config.code_commit_hash,
                 "started_at": started_at,
+                "risk_config_id": config.risk_config_id,
             },
         )
         experiment_id: int = result.scalar_one()
@@ -172,7 +175,7 @@ class ExperimentTracker:
                 SELECT experiment_id, strategy_ids, symbol, timeframe, date_start,
                        date_end, feature_pipeline_version, fee_bps, slippage_model,
                        code_commit_hash, started_at, finished_at, metrics,
-                       equity_curve_path, notes
+                       equity_curve_path, notes, risk_config_id
                 FROM experiments
                 WHERE experiment_id = ANY(:experiment_ids)
                 ORDER BY experiment_id
@@ -195,6 +198,7 @@ class ExperimentTracker:
                     fee_bps=float(row["fee_bps"]) if row["fee_bps"] is not None else 0.0,
                     slippage_model=row["slippage_model"],
                     code_commit_hash=row["code_commit_hash"],
+                    risk_config_id=row["risk_config_id"],
                 ),
                 started_at=row["started_at"],
                 finished_at=row["finished_at"],

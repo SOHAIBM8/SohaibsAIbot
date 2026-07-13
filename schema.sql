@@ -73,6 +73,81 @@ CREATE INDEX idx_signal_log_strategy_regime ON signal_log (strategy_id, regime);
 CREATE INDEX idx_signal_log_experiment ON signal_log (experiment_id);
 
 -- =====================================================================
+-- Risk engine (docs/risk_engine_spec.md) — step 2: RiskConfig only.
+-- kill_switch_state, circuit_breaker_event_log, and risk_decision_log
+-- are added in later steps (3, 4, 9) per the spec's build order.
+-- =====================================================================
+
+CREATE TABLE risk_config (
+    risk_config_id      TEXT PRIMARY KEY,
+    version              TEXT NOT NULL,
+    daily_loss_limit_pct  NUMERIC,
+    weekly_loss_limit_pct NUMERIC,
+    drawdown_tier_1_pct   NUMERIC,
+    drawdown_tier_1_factor NUMERIC,
+    drawdown_tier_2_pct   NUMERIC,
+    drawdown_tier_3_pct   NUMERIC,
+    max_gross_exposure_pct NUMERIC,
+    max_net_exposure_pct   NUMERIC,
+    max_concurrent_positions INT,
+    max_same_symbol_directional_exposure_pct NUMERIC,
+    sizing_method          TEXT,
+    kelly_fraction_multiplier NUMERIC,
+    kelly_min_sample_size    INT,
+    circuit_breaker_atr_percentile_threshold NUMERIC,
+    circuit_breaker_confirmation_bars INT,
+    kill_switch_auto_flatten BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Risk parameters are now versioned and comparable across experiments
+-- exactly like strategy versions already are.
+ALTER TABLE experiments ADD COLUMN risk_config_id TEXT REFERENCES risk_config(risk_config_id);
+
+-- Step 3: kill switch state. Persisted (not held only in memory) so a
+-- process restart never silently clears an emergency stop. 'global' is
+-- the only scope used in V1; the column exists for a future per-
+-- strategy/per-symbol kill switch without a schema change.
+CREATE TABLE kill_switch_state (
+    scope                  TEXT PRIMARY KEY,
+    engaged                BOOLEAN NOT NULL DEFAULT FALSE,
+    engaged_at             TIMESTAMPTZ,
+    engaged_reason         TEXT,
+    engaged_by             TEXT,
+    auto_flatten_positions BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Step 4: audit trail for CircuitBreaker trip/clear transitions.
+-- CircuitBreaker itself is pure in-memory (see core/risk/circuit_breaker.py);
+-- rows here are written by whichever caller has a db handle (RiskEngine,
+-- from step 9 onward).
+CREATE TABLE circuit_breaker_event_log (
+    id            BIGSERIAL PRIMARY KEY,
+    breaker_name  TEXT NOT NULL,
+    event_type    TEXT NOT NULL,   -- 'tripped' | 'cleared'
+    reason        TEXT,
+    occurred_at   TIMESTAMPTZ NOT NULL
+);
+
+-- Step 9: one row per RiskEngine.size() call — the full audit trail of
+-- every sizing decision, approved or rejected.
+CREATE TABLE risk_decision_log (
+    id                BIGSERIAL PRIMARY KEY,
+    experiment_id     INT REFERENCES experiments(experiment_id),
+    bar_time          TIMESTAMPTZ NOT NULL,
+    strategy_id       TEXT NOT NULL,
+    proposed_quantity NUMERIC,
+    approved_quantity NUMERIC,
+    rejection_reason  TEXT,           -- RejectionReason value, or null
+    throttle_reasons  TEXT[],
+    layer_results     JSONB,
+    risk_config_id    TEXT REFERENCES risk_config(risk_config_id)
+);
+
+CREATE INDEX idx_risk_decision_log_experiment ON risk_decision_log (experiment_id);
+
+-- =====================================================================
 -- Historical data ingestion (docs/historical_data_ingestion_spec.md)
 -- =====================================================================
 

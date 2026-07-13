@@ -30,18 +30,30 @@ Per bar, in this exact order:
 Bars before the feature warmup period (NaN in any feature any active
 strategy or the regime detector needs) are skipped for steps 2-3, but
 still marked to market, so the equity curve has no timestamp gaps.
+
+Position sizing (docs/risk_engine_spec.md step 10): entries are sized
+via PositionSizer.size(signal, RiskContext) -> SizingDecision. The
+RiskContext's equity/portfolio_view are a snapshot taken at THIS bar's
+open (the actual fill price), not the signal bar's close — sizing
+reasons about the account state at the moment of execution, matching
+the same next-bar-open philosophy the fill logic already follows. The
+feature_window and regime_state passed to sizing are the ones the
+signal was generated from (the signal bar), since those are guaranteed
+warmed-up/non-NaN — see _PendingEntry.
 """
 
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import pandas as pd
 
+from core.execution_model import ExecutionModel
 from core.feature_store import FeatureWindow
 from core.portfolio import Portfolio, Trade
 from core.position_sizing import PositionSizer
-from core.regime_detector import RegimeDetector
+from core.regime_detector import RegimeDetector, RegimeState
+from core.risk.risk_context import RiskContext
 from core.strategy_base import Signal, StrategyBase
-from core.execution_model import ExecutionModel
 
 REGIME_REQUIRED_FEATURES = ["ema_20", "ema_50", "adx_14", "atr_percentile_90"]
 
@@ -64,6 +76,7 @@ class _PendingEntry:
     strategy_id: str
     signal: Signal
     window: FeatureWindow
+    regime_state: RegimeState
     regime_at_entry: str
 
 
@@ -88,10 +101,17 @@ class BacktestEngine:
         self.position_sizer = position_sizer
         self.execution_model = execution_model
         self.initial_capital = initial_capital
-        self._required_features = sorted(set(
-            REGIME_REQUIRED_FEATURES
-            + [f for s in strategies for f in s.required_features if f not in ("close", "open", "high", "low")]
-        ))
+        self._required_features = sorted(
+            set(
+                REGIME_REQUIRED_FEATURES
+                + [
+                    f
+                    for s in strategies
+                    for f in s.required_features
+                    if f not in ("close", "open", "high", "low")
+                ]
+            )
+        )
 
     def run(self, feature_df: pd.DataFrame) -> BacktestResult:
         self.regime_detector.reset()
@@ -105,12 +125,18 @@ class BacktestEngine:
             for strategy_id, pending in pending_entries.items():
                 if strategy_id in portfolio.open_positions:
                     continue  # a position opened another way in the meantime
-                quantity = self.position_sizer.size(pending.signal, portfolio.cash, pending.window)
+                context = self._build_risk_context(portfolio, pending, timestamp, row["open"])
+                decision = self.position_sizer.size(pending.signal, context)
+                quantity = decision.approved_quantity
                 if quantity > 0:
                     portfolio.open_position(
-                        strategy_id=strategy_id, direction=pending.signal.direction,
-                        reference_price=row["open"], quantity=quantity, entry_time=timestamp,
-                        stop_loss=pending.signal.stop_loss, take_profit=pending.signal.take_profit,
+                        strategy_id=strategy_id,
+                        direction=pending.signal.direction,
+                        reference_price=row["open"],
+                        quantity=quantity,
+                        entry_time=timestamp,
+                        stop_loss=pending.signal.stop_loss,
+                        take_profit=pending.signal.take_profit,
                         regime_at_entry=pending.regime_at_entry,
                     )
             pending_entries = {}
@@ -120,26 +146,40 @@ class BacktestEngine:
 
             # warmup check: skip regime/signal generation until required
             # features are all non-NaN, but still mark to market below
-            warmed_up = not row[self._required_features].isna().any() if self._required_features else True
+            warmed_up = (
+                not row[self._required_features].isna().any() if self._required_features else True
+            )
 
             if warmed_up:
-                window = FeatureWindow(symbol="", timeframe="", as_of=timestamp, values=row.to_dict())
+                window = FeatureWindow(
+                    symbol="", timeframe="", as_of=timestamp, values=row.to_dict()
+                )
                 regime_state = self.regime_detector.classify(window)
                 eligible_ids = {
-                    s.meta.strategy_id for s in self.strategies
+                    s.meta.strategy_id
+                    for s in self.strategies
                     if regime_state.trend in s.meta.works_best_in
-                    and (not s.meta.works_best_in_vol or regime_state.vol in s.meta.works_best_in_vol)
+                    and (
+                        not s.meta.works_best_in_vol or regime_state.vol in s.meta.works_best_in_vol
+                    )
                 }
 
                 for strategy in self.strategies:
                     is_eligible = strategy.meta.strategy_id in eligible_ids
                     if not is_eligible:
-                        signal_log.append(SignalLogEntry(
-                            bar_time=timestamp, strategy_id=strategy.meta.strategy_id,
-                            regime_trend=regime_state.trend.value, regime_vol=regime_state.vol.value,
-                            direction=0, signal_strength=0.0, reasons=[],
-                            rejected_reasons=["not eligible for current regime"], acted_on=False,
-                        ))
+                        signal_log.append(
+                            SignalLogEntry(
+                                bar_time=timestamp,
+                                strategy_id=strategy.meta.strategy_id,
+                                regime_trend=regime_state.trend.value,
+                                regime_vol=regime_state.vol.value,
+                                direction=0,
+                                signal_strength=0.0,
+                                reasons=[],
+                                rejected_reasons=["not eligible for current regime"],
+                                acted_on=False,
+                            )
+                        )
                         continue
 
                     signal = strategy.generate_signal(window)
@@ -147,18 +187,27 @@ class BacktestEngine:
                     already_open = strategy.meta.strategy_id in portfolio.open_positions
                     if signal.direction != 0 and not already_open and i + 1 < len(rows):
                         pending_entries[strategy.meta.strategy_id] = _PendingEntry(
-                            strategy_id=strategy.meta.strategy_id, signal=signal,
-                            window=window, regime_at_entry=regime_state.trend.value,
+                            strategy_id=strategy.meta.strategy_id,
+                            signal=signal,
+                            window=window,
+                            regime_state=regime_state,
+                            regime_at_entry=regime_state.trend.value,
                         )
                         acted_on = True  # queued, not yet filled
 
-                    signal_log.append(SignalLogEntry(
-                        bar_time=timestamp, strategy_id=strategy.meta.strategy_id,
-                        regime_trend=regime_state.trend.value, regime_vol=regime_state.vol.value,
-                        direction=signal.direction, signal_strength=signal.signal_strength,
-                        reasons=signal.reasons, rejected_reasons=signal.rejected_reasons,
-                        acted_on=acted_on,
-                    ))
+                    signal_log.append(
+                        SignalLogEntry(
+                            bar_time=timestamp,
+                            strategy_id=strategy.meta.strategy_id,
+                            regime_trend=regime_state.trend.value,
+                            regime_vol=regime_state.vol.value,
+                            direction=signal.direction,
+                            signal_strength=signal.signal_strength,
+                            reasons=signal.reasons,
+                            rejected_reasons=signal.rejected_reasons,
+                            acted_on=acted_on,
+                        )
+                    )
 
             # 3. mark to market at this bar's close, warmup bars included
             portfolio.mark_to_market(timestamp, row["close"])
@@ -170,7 +219,27 @@ class BacktestEngine:
             index=[t for t, _ in portfolio.equity_curve],
             name="equity",
         )
-        return BacktestResult(trades=portfolio.trades, equity_curve=equity_series, signal_log=signal_log)
+        return BacktestResult(
+            trades=portfolio.trades, equity_curve=equity_series, signal_log=signal_log
+        )
+
+    def _build_risk_context(
+        self,
+        portfolio: Portfolio,
+        pending: _PendingEntry,
+        as_of: datetime,
+        current_price: float,
+    ) -> RiskContext:
+        portfolio_view = portfolio.snapshot(current_price)
+        return RiskContext(
+            equity=portfolio_view.equity,
+            feature_window=pending.window,
+            regime_state=pending.regime_state,
+            portfolio_view=portfolio_view,
+            data_quality_ok=True,
+            data_quality_reason=None,
+            as_of=as_of,
+        )
 
     def _process_exits(self, portfolio: Portfolio, row, timestamp) -> None:
         for strategy_id in list(portfolio.open_positions.keys()):
@@ -193,4 +262,6 @@ class BacktestEngine:
         if portfolio.open_positions and rows:
             last_time, last_row = rows[-1]
             for strategy_id in list(portfolio.open_positions.keys()):
-                portfolio.close_position(strategy_id, last_row["close"], last_time, "end_of_backtest")
+                portfolio.close_position(
+                    strategy_id, last_row["close"], last_time, "end_of_backtest"
+                )

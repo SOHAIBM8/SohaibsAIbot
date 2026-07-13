@@ -6,21 +6,24 @@ from core.execution_model import ExecutionModel
 from core.position_sizing import PositionSizer
 from core.regime_config import RegimeDetectorConfig
 from core.regime_detector import RegimeDetector
+from core.risk.risk_decision import SizingDecision
 from core.strategy_base import Regime, Signal, StrategyBase, StrategyMeta, VolRegime
 
 
 class FixedQuantitySizer(PositionSizer):
     """Deterministic sizer for tests — always trades a fixed quantity,
     so PnL arithmetic is exactly checkable by hand."""
+
     def __init__(self, quantity=10.0):
         self.quantity = quantity
 
-    def size(self, signal, equity, feature_window):
-        return self.quantity
+    def size(self, signal, context):
+        return SizingDecision(approved_quantity=self.quantity, proposed_quantity=self.quantity)
 
 
-def make_strategy(name, trigger_column, direction=1, stop_loss=None, take_profit=None,
-                   regime=Regime.SIDEWAYS):
+def make_strategy(
+    name, trigger_column, direction=1, stop_loss=None, take_profit=None, regime=Regime.SIDEWAYS
+):
     """Builds a minimal StrategyBase subclass whose only logic is:
     'fire once when trigger_column == 1'. Used across tests instead of
     the real reference strategies so each test isolates exactly the
@@ -28,8 +31,12 @@ def make_strategy(name, trigger_column, direction=1, stop_loss=None, take_profit
 
     class _TestStrategy(StrategyBase):
         meta = StrategyMeta(
-            name=name, version="1.0.0", author="test", created_at=None,
-            description="test fixture", parameters={},
+            name=name,
+            version="1.0.0",
+            author="test",
+            created_at=None,
+            description="test fixture",
+            parameters={},
             compatible_pipeline_versions=["features_v1"],
             works_best_in=[regime],
         )
@@ -39,15 +46,21 @@ def make_strategy(name, trigger_column, direction=1, stop_loss=None, take_profit
         def generate_signal(self, feature_window) -> Signal:
             if feature_window.get(trigger_column) == 1:
                 return Signal(
-                    direction=direction, entry_price=feature_window.get("close"),
-                    stop_loss=stop_loss, take_profit=take_profit,
-                    strategy_id=self.meta.strategy_id, signal_strength=1.0,
+                    direction=direction,
+                    entry_price=feature_window.get("close"),
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    strategy_id=self.meta.strategy_id,
+                    signal_strength=1.0,
                     reasons=["test trigger fired"],
                 )
             return Signal(
-                direction=0, entry_price=feature_window.get("close"),
-                stop_loss=None, take_profit=None,
-                strategy_id=self.meta.strategy_id, signal_strength=0.0,
+                direction=0,
+                entry_price=feature_window.get("close"),
+                stop_loss=None,
+                take_profit=None,
+                strategy_id=self.meta.strategy_id,
+                signal_strength=0.0,
                 rejected_reasons=["trigger not set"],
             )
 
@@ -69,17 +82,19 @@ def base_columns(n, trigger_col="buy_trigger", trigger_bar=None):
     arithmetic, which meant the same-bar-close-vs-next-bar-open
     lookahead test couldn't actually distinguish the two cases."""
     open_ = [100.0 + 3 * i for i in range(n)]
-    df = pd.DataFrame({
-        "open": open_,
-        "high": [o + 2 for o in open_],
-        "low": [o - 1 for o in open_],
-        "close": [o + 1 for o in open_],
-        "ema_20": [100.0] * n,
-        "ema_50": [100.0] * n,
-        "adx_14": [10.0] * n,           # below threshold -> SIDEWAYS
-        "atr_percentile_90": [0.5] * n,  # mid-range -> NORMAL_VOL
-        trigger_col: [0] * n,
-    })
+    df = pd.DataFrame(
+        {
+            "open": open_,
+            "high": [o + 2 for o in open_],
+            "low": [o - 1 for o in open_],
+            "close": [o + 1 for o in open_],
+            "ema_20": [100.0] * n,
+            "ema_50": [100.0] * n,
+            "adx_14": [10.0] * n,  # below threshold -> SIDEWAYS
+            "atr_percentile_90": [0.5] * n,  # mid-range -> NORMAL_VOL
+            trigger_col: [0] * n,
+        }
+    )
     if trigger_bar is not None:
         df.loc[trigger_bar, trigger_col] = 1
     return df
@@ -89,17 +104,19 @@ def declining_columns(n, trigger_col="buy_trigger", trigger_bar=None):
     """Same shape as base_columns but with a falling price series —
     for tests where a short position needs to actually be profitable."""
     open_ = [100.0 - 3 * i for i in range(n)]
-    df = pd.DataFrame({
-        "open": open_,
-        "high": [o + 1 for o in open_],
-        "low": [o - 2 for o in open_],
-        "close": [o - 1 for o in open_],
-        "ema_20": [100.0] * n,
-        "ema_50": [100.0] * n,
-        "adx_14": [10.0] * n,
-        "atr_percentile_90": [0.5] * n,
-        trigger_col: [0] * n,
-    })
+    df = pd.DataFrame(
+        {
+            "open": open_,
+            "high": [o + 1 for o in open_],
+            "low": [o - 2 for o in open_],
+            "close": [o - 1 for o in open_],
+            "ema_20": [100.0] * n,
+            "ema_50": [100.0] * n,
+            "adx_14": [10.0] * n,
+            "atr_percentile_90": [0.5] * n,
+            trigger_col: [0] * n,
+        }
+    )
     if trigger_bar is not None:
         df.loc[trigger_bar, trigger_col] = 1
     return df
@@ -116,6 +133,7 @@ def make_engine(strategies, quantity=10.0, fee_bps=0.0, slippage_bps=0.0):
 
 
 # --- the lookahead fix: this is the most important test in this file -------
+
 
 def test_signal_executes_at_next_bar_open_not_signal_bar_close():
     """Trigger fires on bar 3. bar3: open=109, close=110. bar4: open=112,
@@ -148,6 +166,7 @@ def test_no_trade_possible_if_trigger_is_on_the_last_bar():
 
 # --- warmup handling --------------------------------------------------------
 
+
 def test_trigger_during_warmup_produces_no_trade():
     df = base_columns(n=6, trigger_bar=1)
     df.loc[0:2, "adx_14"] = float("nan")  # bars 0-2 still warming up
@@ -172,11 +191,13 @@ def test_equity_curve_has_no_gaps_during_warmup():
 
 # --- long / short round trips with stop-loss / take-profit -----------------
 
+
 def test_long_position_exits_on_take_profit():
     df = base_columns(n=8, trigger_bar=1)
     # bar 2's open is the fill price (102); set take_profit reachable by bar 4's high
-    strategy = make_strategy("tp_probe", "buy_trigger", direction=1,
-                              stop_loss=95.0, take_profit=108.0)
+    strategy = make_strategy(
+        "tp_probe", "buy_trigger", direction=1, stop_loss=95.0, take_profit=108.0
+    )
     engine = make_engine([strategy])
 
     result = engine.run(df)
@@ -189,8 +210,9 @@ def test_long_position_exits_on_take_profit():
 def test_long_position_exits_on_stop_loss():
     df = base_columns(n=8, trigger_bar=1)
     df["low"] = [x - 20 for x in df["low"]]  # push lows down so the stop gets hit
-    strategy = make_strategy("sl_probe", "buy_trigger", direction=1,
-                              stop_loss=90.0, take_profit=500.0)
+    strategy = make_strategy(
+        "sl_probe", "buy_trigger", direction=1, stop_loss=90.0, take_profit=500.0
+    )
     engine = make_engine([strategy])
 
     result = engine.run(df)
@@ -202,8 +224,9 @@ def test_long_position_exits_on_stop_loss():
 
 def test_short_position_profits_when_price_falls():
     df = declining_columns(n=8, trigger_bar=1)
-    strategy = make_strategy("short_probe", "buy_trigger", direction=-1,
-                              stop_loss=200.0, take_profit=None)
+    strategy = make_strategy(
+        "short_probe", "buy_trigger", direction=-1, stop_loss=200.0, take_profit=None
+    )
     engine = make_engine([strategy])
 
     result = engine.run(df)
@@ -226,14 +249,15 @@ def test_open_position_force_closed_at_end_of_backtest():
 
 # --- fees really reduce recorded pnl -----------------------------------------
 
+
 def test_fees_reduce_trade_pnl():
     df = base_columns(n=6, trigger_bar=1)
     strategy = make_strategy("fee_probe", "buy_trigger", stop_loss=None, take_profit=None)
 
     engine_no_fees = make_engine([strategy], fee_bps=0.0)
-    engine_with_fees = make_engine([make_strategy("fee_probe", "buy_trigger",
-                                                   stop_loss=None, take_profit=None)],
-                                    fee_bps=50.0)  # 0.5% each way
+    engine_with_fees = make_engine(
+        [make_strategy("fee_probe", "buy_trigger", stop_loss=None, take_profit=None)], fee_bps=50.0
+    )  # 0.5% each way
 
     pnl_no_fees = engine_no_fees.run(df).trades[0].pnl
     pnl_with_fees = engine_with_fees.run(df).trades[0].pnl
@@ -242,6 +266,7 @@ def test_fees_reduce_trade_pnl():
 
 
 # --- multi-strategy: independent, concurrent positions ----------------------
+
 
 def test_two_strategies_hold_independent_concurrent_positions():
     df = base_columns(n=8, trigger_col="buy_trigger_a")

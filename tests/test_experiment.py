@@ -118,3 +118,33 @@ def test_start_before_finish_has_null_metrics(tracker, cleanup):
     result = table.results[0]
     assert result.finished_at is None
     assert result.metrics == {}
+
+
+def test_risk_config_id_defaults_to_null(tracker, cleanup):
+    experiment_id = tracker.start(make_config())
+    cleanup.append(experiment_id)
+
+    result = tracker.compare([experiment_id]).results[0]
+    assert result.config.risk_config_id is None
+
+
+def test_risk_config_id_round_trips(db, tracker):
+    db.execute(text("""
+            INSERT INTO risk_config (risk_config_id, version)
+            VALUES ('test_risk_config', '1.0.0')
+            ON CONFLICT (risk_config_id) DO NOTHING
+            """))
+    db.commit()
+    try:
+        experiment_id = tracker.start(make_config(risk_config_id="test_risk_config"))
+        try:
+            result = tracker.compare([experiment_id]).results[0]
+            assert result.config.risk_config_id == "test_risk_config"
+        finally:
+            db.execute(
+                text("DELETE FROM experiments WHERE experiment_id = :id"), {"id": experiment_id}
+            )
+            db.commit()
+    finally:
+        db.execute(text("DELETE FROM risk_config WHERE risk_config_id = 'test_risk_config'"))
+        db.commit()

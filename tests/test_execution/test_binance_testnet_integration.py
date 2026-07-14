@@ -47,6 +47,11 @@ from core.execution.order import OrderState, OrderType
 from core.execution.order_manager import OrderManager
 from core.execution.reconciliation_job import ReconciliationJob
 from core.risk.risk_decision import SizingDecision
+from core.security.audit_db import AuditWriterSessionLocal
+from core.security.credential_provider import CredentialProvider
+from core.security.credential_vault import CredentialVault
+from core.security.key_lifecycle_manager import CredentialState, KeyLifecycleManager
+from core.security.kms_client import LocalDevKMSClient
 
 TESTNET_REST = "https://testnet.binance.vision"
 TESTNET_WS_API = "wss://ws-api.testnet.binance.vision/ws-api/v3"
@@ -109,19 +114,64 @@ def db():
 
 
 @pytest.fixture
-def stack(db):
-    """The full real Stage 2 stack against testnet: clock sync, filter
-    cache, adapter, order manager."""
+def audit_db():
+    session = AuditWriterSessionLocal()
+    try:
+        yield session
+    finally:
+        session.rollback()
+        session.close()
+
+
+@pytest.fixture
+def vault() -> CredentialVault:
+    # ONE vault/KMS client instance shared by every fixture in this
+    # test — a second LocalDevKMSClient instance without the env var
+    # set would generate its OWN ephemeral KEK and fail to decrypt
+    # anything encrypted under the first one.
+    return CredentialVault(LocalDevKMSClient(kek_env_var="TESTNET_INTEGRATION_KEK"))
+
+
+@pytest.fixture
+def credential_id(db, vault):
+    """Registers the real testnet credentials (from the same env vars
+    the suite is gated on) through the real Stage 3 vault/lifecycle
+    path — this is the actual CredentialProvider seam Stage 2's adapter
+    now depends on (decision #7), not a shortcut around it."""
+    manager = KeyLifecycleManager(db, vault)
+    cred_id = manager.register(
+        account_id=ACCOUNT_ID,
+        exchange="binance",
+        api_key=os.environ["BINANCE_TESTNET_API_KEY"],
+        api_secret=os.environ["BINANCE_TESTNET_API_SECRET"],
+        mainnet=False,
+    )
+    manager.transition(cred_id, CredentialState.ACTIVE)
+    yield cred_id
+    db.execute(text("DELETE FROM credential_audit_log WHERE credential_id = :c"), {"c": cred_id})
+    db.execute(text("DELETE FROM encrypted_credentials WHERE credential_id = :c"), {"c": cred_id})
+    db.commit()
+
+
+@pytest.fixture
+def stack(db, audit_db, vault, credential_id):
+    """The full real Stage 2+3 stack against testnet: clock sync,
+    filter cache, credential provider, adapter, order manager."""
     clock_sync = ClockSyncService(base_url=TESTNET_REST)
     clock_sync.sync()
 
     filter_cache = SymbolFilterCache(base_url=TESTNET_REST)
     filter_cache.refresh(symbols=[BINANCE_SYMBOL])
 
+    manager = KeyLifecycleManager(db, vault)
+    credential_provider = CredentialProvider(manager, vault, audit_db)
+
     adapter = BinanceExecutionAdapter(
         base_url=TESTNET_REST,
         clock_sync=clock_sync,
         filter_cache=filter_cache,
+        credential_provider=credential_provider,
+        credential_id=credential_id,
         db_session=db,
     )
 

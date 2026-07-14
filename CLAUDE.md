@@ -86,20 +86,110 @@ so Claude Code can continue that work without needing that conversation.
 - **Binance for development**, but the exchange abstraction must support
   Kraken/Coinbase early — Binance.com is unavailable to US users, and this
   is headed toward a multi-user SaaS.
-- **Live Execution & Paper Trading ships in three stages; Stages 1 and
-  2 are built, Stage 3 is not.** `OrderManager` and the order state
-  machine are IDENTICAL for paper and live — only `ExecutionAdapter`
-  differs; Stage 2's `BinanceExecutionAdapter` required ZERO changes to
+- **Live Execution & Paper Trading ships in three stages; all three are
+  now built, but Stage 3 being built is NOT the same thing as being
+  safe to use with real funds — see the explicit caveat at the end of
+  this section.** `OrderManager` and the order state machine are
+  IDENTICAL for paper and live — only `ExecutionAdapter` differs;
+  Stage 2's `BinanceExecutionAdapter` required ZERO changes to
   `OrderManager`, confirming the Stage 1 interface really was
-  adapter-agnostic. **Stage 2 targets Binance TESTNET only.** Mainnet
-  credentials, API key encryption/custody, and any live-trading
-  enablement are Stage 3 and remain entirely unimplemented — do not
-  treat Stage 2 as "trading is live." Testnet credentials are read from
-  `BINANCE_TESTNET_API_KEY`/`BINANCE_TESTNET_API_SECRET` environment
-  variables only, never persisted to Postgres or anywhere else. Every
-  order, paper or live, must originate from an approved
-  `SizingDecision` — no code path places an order without Risk Engine
-  approval.
+  adapter-agnostic. Every order, paper or live, must originate from an
+  approved `SizingDecision` — no code path places an order without Risk
+  Engine approval.
+- **Envelope encryption for exchange credentials, KEK never
+  co-located with the ciphertext (Stage 3 decision #1).**
+  `core/security/credential_vault.py`'s `CredentialVault` generates a
+  fresh per-credential DEK, encrypts the API key/secret with it, and
+  wraps the DEK under a KEK held by a separate `KMSClient`. Only
+  ciphertext is ever persisted (`encrypted_credentials` table).
+  `LocalDevKMSClient` (testnet-only, a real local-key stand-in, never a
+  real cloud KMS) is the only functional `KMSClient` implementation
+  built so far — `AWSKMSClient` is an explicit `NotImplementedError`
+  stub, confirmed with the user, since this project has no cloud
+  infrastructure configured yet and building against untested
+  credentials would be scope creep, not a real capability.
+- **Mainnet credentials structurally cannot use the dev KMS path — a
+  raise, not a warning (Stage 3 decision #6).** `MainnetGate.check()`
+  does an `isinstance()` check against the concrete `LocalDevKMSClient`
+  class (not a spoofable string/flag) and is wired into
+  `CredentialVault.encrypt()` itself — the lowest possible layer — so
+  even a caller that forgot to gate a mainnet request is still refused
+  at the point of key generation. This was the first thing built to
+  touch a `mainnet` flag anywhere in the system, before anything else
+  was allowed to.
+- **Every credential decrypt is audited BEFORE the caller ever sees the
+  plaintext, via an INSERT-only Postgres role (Stage 3 decision #4).**
+  `CredentialProvider.get_credentials()` writes to `credential_audit_log`
+  through the dedicated `credential_audit_writer` role
+  (`core/security/audit_db.py`), which has no `UPDATE`/`DELETE` grant —
+  proven by `test_audit_log_immutability.py` connecting to Postgres
+  *as* that role. **Dev-environment caveat, not glossed over**: this
+  project's bootstrap app role (`trading`) is a Postgres superuser in
+  local docker-compose, and superusers bypass every ACL unconditionally
+  — so "the default app role can't write either" is only fully true in
+  a real deployment where the app's connection role isn't a superuser
+  (which any real production Postgres setup should be anyway). The
+  `credential_audit_writer` boundary itself is real and fully enforced
+  regardless.
+- **No plaintext credential value may appear in a log line, at any
+  level, anywhere — treated as absolute (Stage 3 decision #8), not
+  best-effort.** `test_no_plaintext_in_logs.py` captures the ENTIRE
+  structlog output of the full decrypt-and-audit path (via
+  `structlog.testing.capture_logs()`, which isn't fooled by a log-level
+  filter hiding something at DEBUG) and asserts a known sentinel
+  plaintext value never appears anywhere in it, including on the error
+  path.
+- **`EmergencyCredentialRevocation` is a distinct, more severe gate
+  than `KillSwitch` — its own table, not a reuse of the credential
+  lifecycle state machine's terminal `REVOKED` value (Stage 3 decision
+  #5).** Mirrors `KillSwitch`'s "never auto-clears" posture:
+  `re_grant()` is always explicit and logged, never automatic or
+  time-based. Because nothing in this codebase caches decrypted
+  plaintext beyond a single call (a deliberate Stage 3 step 4 design),
+  "invalidates cached decrypted material" is achieved by refusing every
+  FUTURE decrypt rather than clearing a cache that doesn't exist —
+  documented as an interpretive choice, not a silent reinterpretation.
+- **Arming is a second, independent gate alongside `KillSwitch`, never
+  merged into it (Stage 3 decision #3).** `ArmingService` is scoped per
+  (account, strategy, exchange), expires after 48 hours (confirmed with
+  the user), and reverts to unarmed on any config change, requiring
+  fresh re-confirmation. `is_armed()` computes expiry at READ time — no
+  sweep job needed for correctness. `is_trading_permitted()`
+  (`core/security/arming_service.py`) is the one function that combines
+  both gates; neither `KillSwitch` nor `ArmingService` imports or knows
+  about the other.
+- **`BinanceExecutionAdapter` fetches credentials fresh on every
+  `submit_order()`/`cancel_order()`/`get_order_status()` call, never
+  caching them for the adapter's lifetime — a design change confirmed
+  explicitly with the user before implementing, since it touches the
+  constructor and every public method, not a one-line swap.** A
+  construction-time-only fetch (the more literal reading of decision #7)
+  would let an already-running adapter keep signing requests with a
+  stale credential straight through an `EmergencyCredentialRevocation`,
+  silently defeating decision #5's guarantee.
+  `test_binance_adapter_revocation_integration.py` proves this
+  concretely: a real adapter instance that already placed one order
+  successfully is stopped on its very next call the moment its
+  credential is revoked — no reconstruction needed. None of the
+  idempotency/retry/error-classification/state-machine logic changed;
+  only where the credential value comes from at the moment of signing
+  did (decision #7).
+- **Stage 2 targets Binance TESTNET only; Stage 3's real KMS path is
+  built but has no cloud provider wired in yet.** Mainnet credentials,
+  a real (non-stub) `KMSClient`, and any live-trading enablement
+  decision remain out of scope. Testnet credentials, once registered
+  through `KeyLifecycleManager`, are encrypted at rest — never a plain
+  environment-variable read at the adapter's call site anymore, though
+  the value used to REGISTER a testnet credential still originates from
+  `BINANCE_TESTNET_API_KEY`/`BINANCE_TESTNET_API_SECRET` env vars in
+  tests and scripts, per decision #2 (never persisted unencrypted).
+- **This build being complete and its tests passing is explicitly NOT
+  the same thing as being safe to trade real funds.** Per the user's
+  own instruction, stated here verbatim rather than paraphrased: a
+  deliberate, separate testnet soak period under this full security
+  path must run before any real `mainnet=True` credential is used —
+  that decision belongs to the user, made separately, later, and is
+  not something this codebase or this build decides.
 - **An ambiguous order-submission failure (timeout, connection drop)
   is never assumed to be a failure.** `BinanceExecutionAdapter` queries
   the exchange for the existing `client_order_id` before ever retrying
@@ -162,13 +252,15 @@ so Claude Code can continue that work without needing that conversation.
 Foundations → backtesting engine → execution layer → risk engine → SaaS
 multi-tenancy → AI signal research. AI is deliberately last — infra and
 risk discipline come first. Risk engine is built. Execution layer
-Stage 1 (paper trading + shared order state machine + read-only market
-data) and Stage 2 (real Binance TESTNET order placement) are built;
-Stage 3 (mainnet, API key custody, live trading enablement) is NOT
-started and needs its own spec before any work begins on it. The AI
-Analysis & Signal Explanation Engine (all 9 build-order steps) is
-built, strictly downstream/read-only of everything above it — see the
-dedicated write-up below. SaaS multi-tenancy is next, not yet started.
+Stage 1 (paper trading), Stage 2 (real Binance TESTNET order
+placement), and Stage 3 (live trading security: encrypted credentials,
+arming, audit) are all built. **Built and tested is not the same as
+"cleared for real money"** — see the explicit soak-period caveat in
+the architectural-decisions section above; that call is the user's to
+make separately. The AI Analysis & Signal Explanation Engine (all 9
+build-order steps) is built, strictly downstream/read-only of
+everything above it — see the dedicated write-up below. SaaS
+multi-tenancy is next, not yet started.
 
 ## What's built so far
 - `core/strategy_base.py` — `Signal`, `StrategyMeta`, `StrategyBase`, `Regime`, `VolRegime`
@@ -325,9 +417,10 @@ dedicated write-up below. SaaS multi-tenancy is next, not yet started.
     (nothing in Stage 1's spec assigns that responsibility to any
     class)
 - **Live Execution Stage 2 — Binance TESTNET only** (`core/execution/`,
-  `docs/execution_engine_stage2_spec.md`). Mainnet credentials, key
-  encryption/custody, and live-trading enablement are Stage 3 and are
-  NOT built. Tested against fakes (no real network in the standard
+  `docs/execution_engine_stage2_spec.md`). Mainnet credentials and any
+  live-trading enablement decision remain out of scope (see the Stage 3
+  entry below for what IS now built: key encryption/custody, arming,
+  audit). Tested against fakes (no real network in the standard
   suite, matching every other exchange-facing component); a separate
   `testnet`-marked integration suite makes real testnet calls and is
   skipped unless `BINANCE_TESTNET_API_KEY`/`BINANCE_TESTNET_API_SECRET`
@@ -427,6 +520,97 @@ dedicated write-up below. SaaS multi-tenancy is next, not yet started.
     fill for the first time. Fixing it needs either a mode branch in
     `OrderManager` (forbidden) or a real live-account-balance model —
     realistically Stage 3 territory.
+- **Live Execution Stage 3 — live trading security** (`core/security/`,
+  `docs/execution_engine_stage3_spec.md`). **Complete and tested is
+  explicitly NOT the same as "cleared for real money"** — see the
+  verbatim caveat in the architectural-decisions section above. Tested
+  against fakes/real local Postgres throughout (no real cloud KMS in
+  the unit suite, matching every other "no real network" component in
+  this project); the real testnet suite (Stage 2's, re-run with this
+  stage's credential path wired in) still passes 3/3:
+  - `_aead.py` — shared AES-256-GCM helper (key generation +
+    nonce\|\|ciphertext framing) used by both `LocalDevKMSClient` and
+    `CredentialVault` — one reviewed crypto implementation, not two
+  - `kms_client.py` — `KMSClient` interface, `LocalDevKMSClient` (real,
+    functional, testnet-only), `AWSKMSClient` (explicit
+    `NotImplementedError` stub — confirmed with the user: no cloud KMS
+    infra exists in this project yet, building against it would be
+    untestable scope creep)
+  - `mainnet_gate.py` — `MainnetGate.check()`, raises
+    `MainnetGateViolationError` (never a warning) via `isinstance()`
+    against the concrete `LocalDevKMSClient` class; the FIRST thing
+    built to touch a `mainnet` flag anywhere in the system, proven
+    before anything else was allowed to
+  - `credential_vault.py` — `CredentialVault.encrypt()`/`decrypt()`,
+    envelope encryption; `encrypt()` calls `MainnetGate.check()` as its
+    very first action, the lowest possible layer
+  - `key_lifecycle_manager.py` — `KeyLifecycleManager`, an explicit
+    `_LEGAL_TRANSITIONS` table over `CredentialState` (`PENDING_VALIDATION`
+    / `ACTIVE` / `VALIDATION_FAILED` / `ROTATION_DUE` / `REVOKED`,
+    mirroring `core/execution/order.py`'s pattern — this state machine
+    isn't given verbatim by the spec, designed here and flagged);
+    `REVOKED` reachable from every state, terminal once reached;
+    `sweep_rotation_due()` (90-day cadence, confirmed with the user)
+    is a reminder only, never an automatic key change; gained
+    `record_validation_success()` in step 5 since an already-`ACTIVE`
+    credential's re-check timestamp update isn't a real state
+    transition and can't go through `transition()`'s legality gate
+  - `audit_db.py` + `credential_provider.py` — `CredentialProvider.get_credentials()`
+    writes to `credential_audit_log` via the dedicated INSERT-only
+    `credential_audit_writer` role BEFORE returning anything; never
+    caches plaintext past the call; extended in step 7 with an optional
+    `revocation` check that runs FIRST, before the vault is ever touched
+  - `permission_checker.py` + `binance_permission_checker.py` —
+    `ExchangePermissionChecker` interface + a real signed
+    `GET /sapi/v1/account/apiRestrictions` implementation (reuses Stage
+    2's `ClockSyncService`); one real bug caught by tests: it initially
+    classified every HTTP error ≥400 as fatal, never distinguishing
+    retryable 5xx/429 — fixed to match the project's established
+    classification convention
+  - `permission_validator.py` — `PermissionValidator.validate()`: a
+    withdrawal-enabled finding transitions the credential to
+    `VALIDATION_FAILED`, disarms every strategy via an injected
+    `Disarmer` Protocol (structurally decoupled from `ArmingService`,
+    which doesn't exist until step 6), and publishes
+    `CredentialValidationFailed` — all three, every time, proven
+    together, not just the classification. `sweep_active_credentials()`
+    is decision #2's recurring re-check, same "clean check is still
+    logged evidence" posture as `ReconciliationJob`
+  - `arming_service.py` — `ArmingService` (per account/strategy/exchange,
+    48h expiry confirmed with the user, `is_armed()` computes expiry at
+    READ time so no sweep job is needed for correctness),
+    `disarm_all()` (satisfies `PermissionValidator`'s `Disarmer`
+    Protocol — proven with a real end-to-end integration test once
+    both components existed), `on_config_changed()` (reverts to
+    unarmed, requires fresh re-confirmation). `is_trading_permitted()`
+    is the standalone dual-gate function combining `KillSwitch` +
+    `ArmingService` — neither class imports or knows about the other
+  - `emergency_revocation.py` — `EmergencyCredentialRevocation`, its own
+    `credential_revocation` table (deliberately NOT a reuse of
+    `CredentialState.REVOKED`), mirrors `KillSwitch`'s "never
+    auto-clears" posture; `re_grant()` is always explicit and logged
+  - `events.py` gained `CredentialDecrypted`, `CredentialValidationFailed`,
+    `ArmingStateChanged`, `ArmingExpired`, `EmergencyRevocationTriggered`,
+    `KeyRotationDue`
+  - `core/execution/binance_execution_adapter.py` **rewired, not
+    rewritten** — see the architectural-decisions bullet above for the
+    fresh-fetch-per-call design decision, confirmed explicitly with the
+    user before implementing since it touches the constructor and every
+    public method. All 14 of Stage 2's existing order-logic tests pass
+    with unchanged assertions, only the fixture's credential setup
+    differs — the concrete proof decision #7 actually holds
+  - `schema.sql` gained `encrypted_credentials`, `credential_audit_log`
+    (+ `credential_audit_writer` role/grants, including the
+    easy-to-forget `BIGSERIAL` sequence `USAGE` grant — caught by
+    actually running the immutability test, not assumed), `arming_state`,
+    `credential_revocation`
+  - Known, deliberate gaps: no real cloud `KMSClient` implementation
+    (Stage 3's own open decision #1, confirmed deferred); no live
+    per-trade wiring of the dual gate (`is_trading_permitted()`) into
+    `OrderManager`/`RiskEngine`'s actual order-submission path — this
+    stage built and tested the gate itself, but nothing yet calls it
+    before every live order; that integration is real remaining work,
+    not assumed done
 - **AI Analysis & Signal Explanation Engine** (`core/ai_assistant/`,
   `news_sources/`, `docs/ai_assistant_spec.md`) — strictly downstream
   and read-only with respect to every trading table, enforced at the
@@ -500,35 +684,47 @@ dedicated write-up below. SaaS multi-tenancy is next, not yet started.
     trip (not the full Anthropic multi-turn `tool_result` protocol),
     since the spec's `LLMClient.generate()` signature carries no
     conversation history
-- Full test suite in `tests/` — 474 tests collected: 471 passing +
+- Full test suite in `tests/` — 566 tests collected: 563 passing +
   3 real-testnet-only as of last run, all against real local Postgres
   and/or a real local WebSocket server, no mocks; LLM calls faked in
   the standard suite; Binance calls faked in the standard suite except
   the `testnet`-marked integration suite
   (`test_binance_testnet_integration.py`, requires
   `BINANCE_TESTNET_API_KEY`/`BINANCE_TESTNET_API_SECRET` — skipped
-  without them). **That suite was run against real Binance testnet as
-  part of this build and all 3 tests pass**, confirmed stable across
-  two independent runs — see the architectural-decisions bullet above
-  for the real API-deprecation issue (410 Gone on the old listenKey
-  endpoint) it surfaced and how it was fixed.
+  without them). **That suite was run against real Binance testnet
+  twice during this build — once for Stage 2, again after Stage 3's
+  credential-vault path was wired in — and all 3 tests pass both
+  times**; see the architectural-decisions bullets above for the real
+  API-deprecation issue (410 Gone on the old listenKey endpoint) the
+  first run surfaced and how it was fixed, and for the credential
+  fresh-fetch-per-call design decision the second wiring required.
 
 ## What's NOT built yet (next up)
-- Execution layer Stage 3 (mainnet credentials, API key
-  encryption/custody, live-trading enablement) — needs its own spec
+- Execution layer Stage 3's own open decision #1: a real (non-stub)
+  `KMSClient` for a real cloud provider (AWS KMS / Vault / etc.) —
+  deferred since no cloud infrastructure is configured in this project
+  yet; confirmed with the user rather than built speculatively
+- `is_trading_permitted()` (the `KillSwitch` + `ArmingService` dual
+  gate) is built and tested in isolation but NOT yet called from
+  `OrderManager`/`RiskEngine`'s actual live order-submission path —
+  the gate exists and works; nothing yet consults it before every live
+  order. Real remaining work, not assumed done
 - `SymbolFilterCache` doesn't model Binance's `PERCENT_PRICE_BY_SIDE`
   filter (price-deviation-from-market) — only
   `LOT_SIZE`/`PRICE_FILTER`/`MIN_NOTIONAL` per the spec's decision #5;
   a limit order priced far enough from market will be correctly
   rejected by the exchange (not a crash) but not caught locally first
 - The `paper_accounts.current_cash`-for-live-orders gap flagged above —
-  needs a real live-account-balance model, realistically Stage 3
+  needs a real live-account-balance model
 - Whatever writes `account_snapshots` — nothing does yet (Stage 1
   gap), which is why `DailySummaryContext` can raise `LookupError` for
   dates with no snapshot coverage
 - The real-API (non-pytest) integration tests for `LLMClient` mentioned
   in `docs/ai_assistant_spec.md` section 5 — not run as part of this
   build, since they cost real money and need a real `ANTHROPIC_API_KEY`
+- **A deliberate testnet soak period under the full Stage 3 security
+  path, before any real `mainnet=True` credential is used** — a human
+  decision, made separately by the user, not a code deliverable
 - SaaS layer — all later phases
 
 ## Commands

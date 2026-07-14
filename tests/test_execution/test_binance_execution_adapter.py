@@ -20,17 +20,28 @@ from core.execution.binance_execution_adapter import BinanceExecutionAdapter
 from core.execution.binance_symbol_filter_cache import SymbolFilterCache
 from core.execution.order import Order, OrderState, OrderType
 from core.ingestion.errors import FatalIngestionError
+from core.security.credential_provider import LiveCredentials
 
-API_KEY_ENV = "TEST_BINANCE_TESTNET_API_KEY"
-API_SECRET_ENV = "TEST_BINANCE_TESTNET_API_SECRET"
+CREDENTIAL_ID = "test-credential-id"
 
 
-@pytest.fixture(autouse=True)
-def _fake_credentials(monkeypatch):
-    # Proves credentials are read from env vars only, never persisted —
-    # each test controls exactly what's "on disk" (nothing).
-    monkeypatch.setenv(API_KEY_ENV, "fake-api-key")
-    monkeypatch.setenv(API_SECRET_ENV, "fake-api-secret")
+class _FakeCredentialProvider:
+    """Stands in for the real CredentialProvider (core/security/) —
+    these tests are about BinanceExecutionAdapter's own order-placement
+    logic (decision #7: unchanged by Stage 3), not credential vault/
+    audit-log behavior, which has its own dedicated test suite in
+    tests/test_security/."""
+
+    def __init__(self, api_key: str = "fake-api-key", api_secret: str = "fake-api-secret"):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.calls: list[tuple[str, str, str | None]] = []
+
+    def get_credentials(
+        self, credential_id: str, requested_by: str, client_order_id: str | None = None
+    ) -> LiveCredentials:
+        self.calls.append((credential_id, requested_by, client_order_id))
+        return LiveCredentials(api_key=self.api_key, api_secret=self.api_secret)
 
 
 class _FakeResponse:
@@ -102,8 +113,8 @@ def make_adapter(
         base_url="https://testnet.binance.vision",
         clock_sync=clock_sync,
         filter_cache=filter_cache,
-        api_key_env_var=API_KEY_ENV,
-        api_secret_env_var=API_SECRET_ENV,
+        credential_provider=_FakeCredentialProvider(),
+        credential_id=CREDENTIAL_ID,
         session=session,
         retry_policy=retry_policy,
     )

@@ -6,10 +6,11 @@ PaperExecutionAdapter (integration point #1) — nothing here required
 any change to OrderManager, proving the Stage 1 interface really was
 adapter-agnostic.
 
-**Testnet only.** Credentials come from environment variables
-(`api_key_env_var`/`api_secret_env_var`), read once at construction,
-never persisted anywhere (decision #2). Mainnet, key encryption, and
-live-trading enablement are Stage 3 and are not implemented here.
+**Testnet only** in Stage 2 (a `CredentialProvider` pointed at a real
+KMS/mainnet credential is Stage 3's business, not this file's). As of
+Stage 3 (docs/execution_engine_stage3_spec.md decision #7), credentials
+come from a `CredentialProvider` seam, not an environment variable
+directly — see design note 6 below for exactly what changed and why.
 
 Design notes (rule 9):
 
@@ -59,11 +60,26 @@ Design notes (rule 9):
    holds the same Order object, and handle_fill()/ReconciliationJob
    own actual state transitions; an adapter that transitioned in place
    left them an already-terminal order and an illegal re-transition.
+
+6. Stage 3 wiring (docs/execution_engine_stage3_spec.md decision #7 —
+   confirmed explicitly with the user before making this change, since
+   it touches the constructor and every public method, not a one-line
+   swap): credentials are fetched via `CredentialProvider.get_credentials()`
+   at the START of `submit_order()`/`cancel_order()`/`get_order_status()`
+   — NOT cached as instance attributes for the adapter's lifetime, the
+   way the env-var version worked. This is required, not stylistic:
+   `EmergencyCredentialRevocation` (Stage 3 decision #5) must stop an
+   ALREADY-CONSTRUCTED adapter from placing further orders the moment
+   a credential is revoked — a construction-time-only fetch would let
+   a long-lived adapter keep signing requests with a stale cached
+   credential straight through a revocation, silently defeating the
+   guarantee. None of the idempotency/retry/error-classification/
+   state-machine logic below changed even slightly — only where the
+   credential value comes from at the moment of signing did.
 """
 
 import hashlib
 import hmac
-import os
 import urllib.parse
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -83,6 +99,7 @@ from core.execution.execution_adapter import ExecutionAdapter
 from core.execution.order import Fill, Order, OrderState, OrderType
 from core.ingestion.errors import FatalIngestionError, RetryableIngestionError
 from core.ingestion.retry_policy import RetryPolicy
+from core.security.credential_provider import CredentialProvider, LiveCredentials
 
 logger = structlog.get_logger(__name__)
 
@@ -122,8 +139,8 @@ class BinanceExecutionAdapter(ExecutionAdapter):
         base_url: str,
         clock_sync: ClockSyncService,
         filter_cache: SymbolFilterCache,
-        api_key_env_var: str = "BINANCE_TESTNET_API_KEY",
-        api_secret_env_var: str = "BINANCE_TESTNET_API_SECRET",
+        credential_provider: CredentialProvider,
+        credential_id: str,
         session: requests.Session | None = None,
         timeout_seconds: float = 10.0,
         recv_window_ms: int = 5000,
@@ -131,10 +148,10 @@ class BinanceExecutionAdapter(ExecutionAdapter):
         db_session: Session | None = None,
     ):
         self._base_url = base_url
-        self._api_key = os.environ[api_key_env_var]
-        self._api_secret = os.environ[api_secret_env_var]
         self._clock_sync = clock_sync
         self._filter_cache = filter_cache
+        self._credential_provider = credential_provider
+        self._credential_id = credential_id
         self._session = session or requests.Session()
         self._timeout = timeout_seconds
         self._recv_window_ms = recv_window_ms
@@ -143,6 +160,13 @@ class BinanceExecutionAdapter(ExecutionAdapter):
 
         self._orders: dict[str, Order] = {}
         self._fills: dict[str, list[Fill]] = {}
+
+    def _fetch_credentials(
+        self, requested_by: str, client_order_id: str | None = None
+    ) -> LiveCredentials:
+        return self._credential_provider.get_credentials(
+            self._credential_id, requested_by=requested_by, client_order_id=client_order_id
+        )
 
     # --- ExecutionAdapter interface --------------------------------
 
@@ -164,18 +188,26 @@ class BinanceExecutionAdapter(ExecutionAdapter):
             self._orders[order.client_order_id] = order
             return order
 
+        credentials = self._fetch_credentials(
+            "binance_execution_adapter.submit_order", client_order_id=order.client_order_id
+        )
+
         try:
-            payload = self._retry_policy.execute(lambda: self._send_new_order_once(order))
+            payload = self._retry_policy.execute(
+                lambda: self._send_new_order_once(order, credentials)
+            )
         except _AmbiguousFailureError:
             logger.warning(
                 "binance_submission_ambiguous_checking_existing",
                 client_order_id=order.client_order_id,
             )
-            existing = self._lookup_existing_order(order)
+            existing = self._lookup_existing_order(order, credentials)
             if existing is not None:
                 payload = existing
             else:
-                payload = self._retry_policy.execute(lambda: self._send_new_order_once(order))
+                payload = self._retry_policy.execute(
+                    lambda: self._send_new_order_once(order, credentials)
+                )
         except _OrderRejectedError as exc:
             order.transition_to(OrderState.REJECTED, datetime.now(UTC))
             logger.warning(
@@ -195,10 +227,14 @@ class BinanceExecutionAdapter(ExecutionAdapter):
 
     def cancel_order(self, client_order_id: str) -> Order:
         order = self._require_order(client_order_id)
+        credentials = self._fetch_credentials(
+            "binance_execution_adapter.cancel_order", client_order_id=client_order_id
+        )
         response = self._signed_request(
             "DELETE",
             "/api/v3/order",
             {"symbol": _binance_symbol(order.symbol), "origClientOrderId": client_order_id},
+            credentials,
         )
         if response.status_code >= 400:
             self._raise_for_error_response(response)
@@ -207,10 +243,14 @@ class BinanceExecutionAdapter(ExecutionAdapter):
 
     def get_order_status(self, client_order_id: str) -> Order:
         order = self._require_order(client_order_id)
+        credentials = self._fetch_credentials(
+            "binance_execution_adapter.get_order_status", client_order_id=client_order_id
+        )
         response = self._signed_request(
             "GET",
             "/api/v3/order",
             {"symbol": _binance_symbol(order.symbol), "origClientOrderId": client_order_id},
+            credentials,
         )
         if response.status_code >= 400:
             self._raise_for_error_response(response)
@@ -221,19 +261,20 @@ class BinanceExecutionAdapter(ExecutionAdapter):
 
     # --- order submission internals ---------------------------------
 
-    def _send_new_order_once(self, order: Order) -> dict:
+    def _send_new_order_once(self, order: Order, credentials: LiveCredentials) -> dict:
         params = self._build_order_params(order)
-        response = self._signed_request("POST", "/api/v3/order", params)
+        response = self._signed_request("POST", "/api/v3/order", params, credentials)
         if response.status_code < 400:
             return dict(response.json())
         self._raise_for_error_response(response)
         raise AssertionError("unreachable")  # _raise_for_error_response always raises
 
-    def _lookup_existing_order(self, order: Order) -> dict | None:
+    def _lookup_existing_order(self, order: Order, credentials: LiveCredentials) -> dict | None:
         response = self._signed_request(
             "GET",
             "/api/v3/order",
             {"symbol": _binance_symbol(order.symbol), "origClientOrderId": order.client_order_id},
+            credentials,
         )
         if response.status_code == 200:
             return dict(response.json())
@@ -330,14 +371,16 @@ class BinanceExecutionAdapter(ExecutionAdapter):
 
     # --- signed HTTP plumbing ----------------------------------------
 
-    def _signed_request(self, method: str, path: str, params: dict) -> requests.Response:
+    def _signed_request(
+        self, method: str, path: str, params: dict, credentials: LiveCredentials
+    ) -> requests.Response:
         signed_params = dict(params)
         signed_params["timestamp"] = self._clock_sync.corrected_timestamp_ms()
         signed_params["recvWindow"] = self._recv_window_ms
-        signed_params["signature"] = self._sign(signed_params)
+        signed_params["signature"] = self._sign(signed_params, credentials.api_secret)
 
         url = f"{self._base_url}{path}"
-        headers = {"X-MBX-APIKEY": self._api_key}
+        headers = {"X-MBX-APIKEY": credentials.api_key}
         try:
             if method == "GET":
                 return self._session.get(
@@ -360,9 +403,9 @@ class BinanceExecutionAdapter(ExecutionAdapter):
             # just a bug.
             raise FatalIngestionError(f"request build failed calling {path}: {exc}") from exc
 
-    def _sign(self, params: dict) -> str:
+    def _sign(self, params: dict, api_secret: str) -> str:
         query = urllib.parse.urlencode(params)
-        return hmac.new(self._api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+        return hmac.new(api_secret.encode(), query.encode(), hashlib.sha256).hexdigest()
 
     def _raise_for_error_response(self, response: requests.Response) -> None:
         code, message = self._parse_error_body(response)

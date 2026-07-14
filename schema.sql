@@ -495,3 +495,114 @@ CREATE TABLE reconciliation_log (
     corrected                      BOOLEAN NOT NULL,
     checked_at                       TIMESTAMPTZ NOT NULL
 );
+
+-- =====================================================================
+-- Live Execution Stage 3 (docs/execution_engine_stage3_spec.md) — live
+-- trading security: envelope-encrypted credentials, arming, audit.
+-- =====================================================================
+
+-- Step 3: encrypted credential storage. Only ciphertext lives here —
+-- the KEK that unwraps wrapped_dek lives in an external KMS
+-- (LocalDevKMSClient for testnet dev; a real KMS is required whenever
+-- mainnet = TRUE, enforced in code by MainnetGate, not by this schema).
+CREATE TABLE encrypted_credentials (
+    credential_id      TEXT PRIMARY KEY,
+    account_id           TEXT NOT NULL,
+    exchange               TEXT NOT NULL,
+    encrypted_api_key        BYTEA NOT NULL,
+    encrypted_api_secret       BYTEA NOT NULL,
+    wrapped_dek                  BYTEA NOT NULL,
+    kek_key_id                     TEXT NOT NULL,
+    state                            TEXT NOT NULL,
+    mainnet                            BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at                           TIMESTAMPTZ NOT NULL,
+    last_validated_at                      TIMESTAMPTZ,
+    last_rotated_at                          TIMESTAMPTZ,
+    rotation_due_at                            TIMESTAMPTZ
+);
+
+-- Step 4: append-only credential access audit trail (decision #4).
+-- credential_audit_writer has INSERT only — no UPDATE/DELETE grant
+-- exists for it, which is what makes this trail actually trustworthy
+-- rather than merely conventionally append-only.
+--
+-- Dev-environment caveat, recorded here rather than glossed over: this
+-- project's docker-compose bootstrap role ("trading", POSTGRES_USER)
+-- is a Postgres SUPERUSER (confirmed via pg_roles.rolsuper), and
+-- superusers bypass every ACL check unconditionally — no GRANT/REVOKE
+-- can restrict a superuser, full stop. Decision #4's "no UPDATE/DELETE
+-- grant to any role, including the default app role" is therefore only
+-- fully enforceable in a deployment where the app's connection role is
+-- NOT a superuser, which any real production Postgres setup should be
+-- using anyway (a superuser app connection is its own, separate,
+-- pre-existing risk this stage doesn't introduce or fix). The role-
+-- level restriction below is written correctly for that real
+-- deployment shape; test_audit_log_immutability.py tests the boundary
+-- that IS meaningfully enforceable here — credential_audit_writer
+-- itself, a genuine non-superuser role — and documents this caveat
+-- rather than asserting something false about "trading" in this
+-- environment.
+CREATE TABLE credential_audit_log (
+    entry_id          BIGSERIAL PRIMARY KEY,
+    credential_id       TEXT NOT NULL REFERENCES encrypted_credentials(credential_id),
+    action                 TEXT NOT NULL,
+    requested_by              TEXT NOT NULL,
+    client_order_id             TEXT,
+    occurred_at                    TIMESTAMPTZ NOT NULL
+);
+
+DO $$
+BEGIN
+   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'credential_audit_writer') THEN
+      CREATE ROLE credential_audit_writer LOGIN PASSWORD 'credential_audit_writer_dev_password';
+   END IF;
+END
+$$;
+GRANT CONNECT ON DATABASE trading_platform TO credential_audit_writer;
+GRANT USAGE ON SCHEMA public TO credential_audit_writer;
+GRANT INSERT ON credential_audit_log TO credential_audit_writer;
+-- INSERTing into a BIGSERIAL column requires USAGE on its backing
+-- sequence too — an easy grant to forget, caught by actually running
+-- test_audit_log_immutability.py's INSERT test rather than assuming
+-- table-level INSERT alone is sufficient.
+GRANT USAGE, SELECT ON SEQUENCE credential_audit_log_entry_id_seq TO credential_audit_writer;
+-- credential_audit_writer also needs to read encrypted_credentials.credential_id
+-- to satisfy the FK on insert — SELECT only, never write.
+GRANT SELECT ON encrypted_credentials TO credential_audit_writer;
+-- Deliberately no UPDATE/DELETE grant on credential_audit_log to any
+-- role — CredentialProvider itself connects to Postgres AS
+-- credential_audit_writer specifically to write this table.
+
+-- Step 6: per-(account, strategy, exchange) trading consent (decision
+-- #3), distinct from and checked independently alongside the Risk
+-- Engine's existing kill_switch_state. is_armed() computes expiry at
+-- READ time (armed can go stale=TRUE in this row past expires_at) —
+-- so "armed" here is the last-set intent, not a live-current fact by
+-- itself; ArmingService is what makes it live-accurate.
+CREATE TABLE arming_state (
+    account_id      TEXT NOT NULL,
+    strategy_id       TEXT NOT NULL,
+    exchange            TEXT NOT NULL,
+    armed                 BOOLEAN NOT NULL DEFAULT FALSE,
+    armed_at                TIMESTAMPTZ,
+    expires_at                 TIMESTAMPTZ,
+    armed_by                     TEXT,
+    mainnet                        BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (account_id, strategy_id, exchange)
+);
+
+-- Step 7: EmergencyCredentialRevocation's own gate — deliberately a
+-- SEPARATE table from encrypted_credentials.state (decision #5: this
+-- is "a distinct, more severe action than the kill switch", not a
+-- reuse of the lifecycle state machine's already-terminal REVOKED
+-- value). Re-grant is explicit and logged, never automatic/time-based
+-- — mirrors kill_switch_state's "never auto-clears" posture exactly.
+CREATE TABLE credential_revocation (
+    credential_id     TEXT PRIMARY KEY REFERENCES encrypted_credentials(credential_id),
+    revoked             BOOLEAN NOT NULL DEFAULT FALSE,
+    revoked_at             TIMESTAMPTZ,
+    revoked_by                TEXT,
+    reason                       TEXT,
+    re_granted_at                  TIMESTAMPTZ,
+    re_granted_by                     TEXT
+);

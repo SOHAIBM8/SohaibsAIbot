@@ -40,6 +40,13 @@ Design notes (rule 9 — gaps in the spec, filled in and flagged here):
    model to populate it would be scope creep into what a real
    portfolio/position layer for live trading should look like, which
    is explicitly Stage 2/3 territory.
+
+4. `orders.account_id` (added by docs/ai_assistant_spec.md step 5, an
+   additive/nullable column) is now written on every insert. Nothing
+   in this file's own spec needed it — OrderManager already knew
+   self.account_id in-process — but nothing outside this process could
+   ever recover which account an order belonged to without it, and the
+   AI assistant's account-scoped daily summary needs exactly that.
 """
 
 import uuid
@@ -173,14 +180,14 @@ class OrderManager:
                 INSERT INTO orders (
                     client_order_id, exchange_order_id, strategy_id, symbol, order_type,
                     direction, quantity, limit_price, stop_price, mode, state,
-                    risk_decision_id, created_at, updated_at
+                    risk_decision_id, created_at, updated_at, account_id
                 ) VALUES (
                     :client_order_id, :exchange_order_id, :strategy_id, :symbol, :order_type,
                     :direction, :quantity, :limit_price, :stop_price, :mode, :state,
-                    :risk_decision_id, :created_at, :updated_at
+                    :risk_decision_id, :created_at, :updated_at, :account_id
                 )
                 """),
-            self._order_params(order),
+            {**self._order_params(order), "account_id": self.account_id},
         )
         self.db.commit()
 

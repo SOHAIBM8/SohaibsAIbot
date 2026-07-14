@@ -23,9 +23,15 @@ dev = [
     "black>=24.0",
     "mypy>=1.10",
 ]
+# Only needed for a real Claude API call (core/ai_assistant/llm_client.py's
+# lazy _build_real_client()) — the standard test suite uses a fake
+# client and never imports this.
+llm = [
+    "anthropic>=0.40",
+]
 
 [tool.setuptools.packages.find]
-include = ["core*", "strategies*"]
+include = ["core*", "strategies*", "news_sources*"]
 
 [tool.ruff]
 line-length = 100

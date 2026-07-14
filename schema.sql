@@ -359,3 +359,112 @@ CREATE TABLE account_snapshots (
     open_position_count       INT NOT NULL,
     snapshot_at                 TIMESTAMPTZ NOT NULL
 );
+
+-- =====================================================================
+-- AI Analysis & Signal Explanation Engine (docs/ai_assistant_spec.md)
+-- Strictly downstream and read-only w.r.t. every trading table above —
+-- see the llm_readonly role (step 2, below) for the guarantee enforced
+-- at the database grant level, not just in application code.
+-- =====================================================================
+
+-- Step 1: versioned prompt templates. The only place system-prompt
+-- wording lives (decision #5) — every generated explanation references
+-- a template_id here, so what was asked is always reproducible.
+CREATE TABLE prompt_templates (
+    template_id    TEXT PRIMARY KEY,
+    version         TEXT NOT NULL,
+    subject_type     TEXT NOT NULL,   -- 'trade' | 'risk_decision' | 'regime' | 'daily_summary' | 'chat'
+    template_text      TEXT NOT NULL,
+    created_at            TIMESTAMPTZ NOT NULL
+);
+
+-- Step 2: dedicated read-only role (decision #1). No INSERT/UPDATE/
+-- DELETE grant exists for this role on ANY table, now or in the
+-- future — any table added later (including a future exchange-key
+-- vault) must be deliberately excluded from this role's grants, not
+-- deliberately included. Password is a local-dev-only convenience,
+-- matching the plaintext POSTGRES_PASSWORD already used for the
+-- primary app role in docker-compose.yml; override via
+-- LLM_READONLY_DATABASE_URL (core/ai_assistant/readonly_db.py) for
+-- any non-local environment.
+DO $$
+BEGIN
+   IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'llm_readonly') THEN
+      CREATE ROLE llm_readonly LOGIN PASSWORD 'llm_readonly_dev_password';
+   END IF;
+END
+$$;
+GRANT CONNECT ON DATABASE trading_platform TO llm_readonly;
+GRANT USAGE ON SCHEMA public TO llm_readonly;
+GRANT SELECT ON
+    signal_log, risk_decision_log, orders, fills,
+    experiments, paper_accounts, account_snapshots
+TO llm_readonly;
+-- news_articles is granted in step 6, once that table exists.
+
+-- Step 3: daily LLM call/cost cap, enforced in code
+-- (core/ai_assistant/llm_usage_tracker.py), not just configured.
+-- daily_cap_calls is stored per-row (not read from config at query
+-- time) so a changed cap never silently rewrites the meaning of an
+-- already-closed day's history.
+CREATE TABLE llm_usage_daily (
+    usage_date         DATE PRIMARY KEY,
+    calls_made           INT NOT NULL DEFAULT 0,
+    tokens_used             BIGINT NOT NULL DEFAULT 0,
+    estimated_cost             NUMERIC NOT NULL DEFAULT 0,
+    daily_cap_calls               INT NOT NULL,
+    daily_cap_reached                BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+-- Step 4: one row per actually-generated explanation. grounding_fact_hash
+-- is what ExplanationCache keys on to avoid a repeat LLM call for
+-- unchanged facts; prompt_template_id makes every explanation
+-- traceable to the exact wording that produced it (decision #5).
+CREATE TABLE llm_explanations (
+    explanation_id    BIGSERIAL PRIMARY KEY,
+    subject_type        TEXT NOT NULL,
+    subject_id            TEXT NOT NULL,
+    grounding_fact_hash     TEXT NOT NULL,
+    prompt_template_id        TEXT NOT NULL REFERENCES prompt_templates(template_id),
+    model_used                  TEXT NOT NULL,
+    generated_text                TEXT NOT NULL,
+    generated_at                    TIMESTAMPTZ NOT NULL,
+    tokens_used                      INT,
+    cost_estimate                      NUMERIC
+);
+
+CREATE INDEX idx_llm_explanations_subject_hash
+    ON llm_explanations (subject_type, subject_id, grounding_fact_hash);
+
+-- Step 6: news articles. UNIQUE(url) is a necessary addition beyond
+-- the spec's literal column list — NewsIngestionService's ON CONFLICT
+-- DO NOTHING idempotency needs a unique/exclusion constraint to target,
+-- and a URL is a sufficient natural key for one article across repeated
+-- feed fetches.
+CREATE TABLE news_articles (
+    article_id     BIGSERIAL PRIMARY KEY,
+    source          TEXT NOT NULL,
+    url              TEXT NOT NULL UNIQUE,
+    title             TEXT NOT NULL,
+    published_at       TIMESTAMPTZ,
+    ingested_at          TIMESTAMPTZ NOT NULL,
+    raw_content            TEXT
+);
+
+GRANT SELECT ON news_articles TO llm_readonly;
+
+-- Step 5: orders had no account_id column — Stage 1's execution schema
+-- never needed one (OrderManager already tracks account_id in-process,
+-- see its own module docstring point 2), but ContextBuilder.
+-- build_daily_summary_context() is account-scoped and has no other way
+-- to determine which orders belong to which paper account. Additive,
+-- nullable (a live-mode order in a future stage may have no paper
+-- account at all) — same pattern as `experiments.risk_config_id`.
+ALTER TABLE orders ADD COLUMN account_id TEXT REFERENCES paper_accounts(account_id);
+
+-- Step 5: DailySummaryJob is "triggered by the existing Scheduler, not
+-- a new scheduling mechanism" — Scheduler.run_once() needs a per-
+-- account "when did this last run" watermark to decide if a nightly
+-- summary is due, exactly like ingestion_watermark already does for
+-- backfill/gap-scan/data-quality cadence. Additive, nullable.
+ALTER TABLE paper_accounts ADD COLUMN last_daily_summary_at TIMESTAMPTZ;

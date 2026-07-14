@@ -10,6 +10,16 @@ non-goals).
 `run_once()` does one full sweep and is what tests call directly, for
 determinism. `run_forever()` wraps it in a sleep loop for the real
 containerized process.
+
+Design note (rule 9, docs/ai_assistant_spec.md step 5): that spec
+requires DailySummaryJob to be "triggered by the existing Scheduler,
+not a new scheduling mechanism" — decision #7 (nightly-scheduled only,
+never synchronous from a trading event). The optional
+`daily_summary_job` param below is the entire integration surface:
+Scheduler gains no ai_assistant import at module scope (only inside
+the branch that uses it, avoiding a hard dependency for every existing
+ingestion-only caller/test), and every existing test that doesn't pass
+this param is completely unaffected.
 """
 
 import threading
@@ -17,6 +27,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 import structlog
 from sqlalchemy import text
@@ -32,6 +43,12 @@ from core.ingestion.gap_repair_service import GapRepairService
 from core.ingestion.incremental_update_service import IncrementalUpdateService
 from core.ingestion.watermark import get_watermark
 
+if TYPE_CHECKING:
+    # Import only for type checking — avoids ingestion (an already-
+    # complete, ai_assistant-agnostic component) gaining a hard runtime
+    # dependency on core.ai_assistant just to type-hint an optional param.
+    from core.ai_assistant.daily_summary_job import DailySummaryJob
+
 logger = structlog.get_logger(__name__)
 
 NIGHTLY_INTERVAL = timedelta(hours=24)
@@ -44,6 +61,7 @@ class SweepSummary:
     gap_scans_run: list[str] = field(default_factory=list)
     data_quality_runs: list[str] = field(default_factory=list)
     gap_repairs_run: list[str] = field(default_factory=list)
+    daily_summaries_run: list[str] = field(default_factory=list)
 
 
 class Scheduler:
@@ -53,11 +71,13 @@ class Scheduler:
         adapters: dict[str, ExchangeAdapter],
         config: IngestionConfig,
         event_bus: EventBus | None = None,
+        daily_summary_job: "DailySummaryJob | None" = None,
     ):
         self.db = db
         self.adapters = adapters
         self.config = config
         self.event_bus = event_bus
+        self.daily_summary_job = daily_summary_job
         self._stop = threading.Event()
 
     def run_once(self, now: datetime | None = None) -> SweepSummary:
@@ -119,7 +139,43 @@ class Scheduler:
             ):
                 summary.gap_repairs_run.append(key)
 
+        if self.daily_summary_job is not None:
+            self._run_daily_summaries(summary, now)
+
         return summary
+
+    def _run_daily_summaries(self, summary: SweepSummary, now: datetime) -> None:
+        assert self.daily_summary_job is not None
+        accounts = (
+            self.db.execute(text("SELECT account_id, last_daily_summary_at FROM paper_accounts"))
+            .mappings()
+            .all()
+        )
+
+        for account in accounts:
+            account_id = account["account_id"]
+            if not self._due(
+                account["last_daily_summary_at"], NIGHTLY_INTERVAL.total_seconds(), now
+            ):
+                continue
+            try:
+                self.daily_summary_job.run_for_account(account_id, now.date())
+            except LookupError:
+                # No account_snapshots data to summarize yet (Stage 1
+                # has no snapshot-writer — see DailySummaryContext's
+                # docstring). Not a scheduler failure; nothing to do
+                # until that gap is closed elsewhere.
+                logger.info("daily_summary_skipped_no_equity_data", account_id=account_id)
+                continue
+            self.db.execute(
+                text("""
+                    UPDATE paper_accounts SET last_daily_summary_at = :now
+                    WHERE account_id = :account_id
+                    """),
+                {"now": now, "account_id": account_id},
+            )
+            self.db.commit()
+            summary.daily_summaries_run.append(account_id)
 
     def run_forever(
         self, poll_interval_seconds: float = 30.0, sleep: Callable[[float], None] | None = None

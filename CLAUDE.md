@@ -98,6 +98,23 @@ so Claude Code can continue that work without needing that conversation.
   Stage 1 as "the execution layer is done." Every order, paper or
   live, must originate from an approved `SizingDecision` — no code
   path places an order without Risk Engine approval.
+- **The AI Analysis & Signal Explanation Engine has zero write access to
+  any trading table, enforced at the Postgres role level, not just in
+  application code.** `ContextBuilder` and every `ChatTool` connect via
+  the dedicated `llm_readonly` Postgres role
+  (`core/ai_assistant/readonly_db.py`), which has `SELECT`-only grants
+  on `signal_log`, `risk_decision_log`, `orders`, `fills`, `experiments`,
+  `paper_accounts`, `account_snapshots`, `news_articles` — no
+  INSERT/UPDATE/DELETE grant exists for it on any table, now or in the
+  future. This is proven, not just asserted: `test_readonly_role_enforcement.py`
+  connects to Postgres *as* `llm_readonly` and confirms the database
+  itself refuses every write, independent of what application code
+  does or doesn't do. `ChatToolRegistry.execute_tool_call()` also
+  strips any account/user identifier an LLM supplies and injects the
+  real authenticated session's `account_id` instead — proven by
+  `test_prompt_injection_resistance.py`. Explanation generation is
+  on-demand or nightly-scheduled only, never triggered synchronously
+  from a trading event.
 
 ## Build order (don't skip ahead)
 Foundations → backtesting engine → execution layer → risk engine → SaaS
@@ -106,7 +123,10 @@ risk discipline come first. Risk engine is built. Execution layer
 Stage 1 (paper trading + shared order state machine + read-only market
 data) is built; Stage 2 (real exchange order placement) and Stage 3
 (live trading enablement, API key custody) are NOT started and need
-their own specs before any work begins on them.
+their own specs before any work begins on them. The AI Analysis &
+Signal Explanation Engine (all 9 build-order steps) is built, strictly
+downstream/read-only of everything above it — see the dedicated
+write-up below. SaaS multi-tenancy is next, not yet started.
 
 ## What's built so far
 - `core/strategy_base.py` — `Signal`, `StrategyMeta`, `StrategyBase`, `Regime`, `VolRegime`
@@ -262,15 +282,93 @@ their own specs before any work begins on them.
     else could supply them; no `account_snapshots` writing logic yet
     (nothing in Stage 1's spec assigns that responsibility to any
     class)
-- Full test suite in `tests/` — 345 tests passing as of last run (231 prior +
-  114 across `tests/test_execution/` and `tests/test_marketdata/`, all
-  against real local Postgres and/or a real local WebSocket server, no
-  mocks)
+- **AI Analysis & Signal Explanation Engine** (`core/ai_assistant/`,
+  `news_sources/`, `docs/ai_assistant_spec.md`) — strictly downstream
+  and read-only with respect to every trading table, enforced at the
+  Postgres role level (see the architectural-decisions bullet above),
+  tested end-to-end against real local Postgres, no mocks; only
+  `LLMClient`'s Anthropic calls are faked (never real network in the
+  standard suite, matching the project's established pattern):
+  - `prompt_template.py` — `PromptTemplate`/`PromptTemplateRegistry`,
+    the only place system-prompt wording lives; every explanation
+    references an exact template id/version
+  - `readonly_db.py` — `ReadonlySessionLocal`, bound to the dedicated
+    `llm_readonly` Postgres role (`SELECT`-only grants, added to
+    `schema.sql`)
+  - `context_builder.py` — `ContextBuilder`: `build_trade_context()`,
+    `build_risk_decision_context()`, `build_regime_context()`,
+    `build_daily_summary_context()`. Pulls exactly the relevant rows
+    for one subject, no broader query, no invented facts — raises
+    rather than fabricating when grounding data is missing (e.g. no
+    matching `signal_log` row, no `account_snapshots` coverage for a
+    requested date)
+  - `llm_usage_tracker.py` — `LLMUsageTracker`, check-then-increment in
+    one method against `llm_usage_daily` so the daily call cap is
+    enforced code, not configuration nothing reads
+  - `llm_client.py` — `LLMClient`, wraps the Claude API; the real
+    `anthropic` SDK is an optional dependency
+    (`pyproject [project.optional-dependencies].llm`), imported lazily
+    only for a real call — the standard test suite never needs it
+  - `explanation_cache.py` — `ExplanationCache.get_or_generate()`,
+    hash-keyed on serialized grounding facts (`llm_explanations`); a
+    cache hit costs zero LLM calls
+  - `daily_summary_job.py` — `DailySummaryJob`, triggered by the
+    existing ingestion `Scheduler` (an additive, optional
+    `daily_summary_job` param — zero new scheduling mechanism, zero
+    hard runtime dependency from ingestion onto `core.ai_assistant`)
+  - `news_source_adapter.py`/`news_source_registry.py`/
+    `news_ingestion_service.py` + `news_sources/coindesk_rss_adapter.py`
+    — structural copy of `ExchangeAdapter`/`StrategyRegistry`'s
+    discovery pattern; idempotent on `news_articles.url`
+  - `chat_tool.py`/`chat_tool_registry.py` — `ChatTool` (no
+    write-capable tool exists anywhere in this component, structurally,
+    not by omission) + `ChatToolRegistry.execute_tool_call()`, the
+    single choke point that strips any LLM-supplied `account_id`/
+    `user_id` and injects the real session's. `GetTradeTool` additionally
+    verifies resource *ownership* (an order's `account_id`) before
+    returning anything — account-id injection resistance alone isn't
+    sufficient if a tool trusts a caller-supplied resource id
+  - `chat_query_service.py` — `ChatQueryService.answer()`, logs every
+    question/tool-call/response to `llm_query_log` unconditionally
+  - `events.py` — `ExplanationGenerated`, `NewsIngested`,
+    `ChatQueryAnswered`, `LLMUsageCapReached`
+  - Two required security tests, both passing:
+    `test_readonly_role_enforcement.py` (connects to Postgres *as*
+    `llm_readonly`, proves the database itself refuses every write) and
+    `test_prompt_injection_resistance.py` (a scripted fake LLM attempts
+    a cross-account `account_id` injection and a nonexistent/write-style
+    tool name; both refused)
+  - Schema additions beyond the spec's literal list, each flagged in
+    code where it happened: `orders.account_id` (nullable FK to
+    `paper_accounts` — Stage 1's execution schema had no way to
+    attribute an order to an account at all) and
+    `paper_accounts.last_daily_summary_at` (the Scheduler's due-date
+    watermark for `DailySummaryJob`, mirroring `ingestion_watermark`'s
+    existing pattern)
+  - Known, deliberate gaps: `DailySummaryContext.equity_start`/
+    `equity_end` raise `LookupError` for any date `account_snapshots`
+    doesn't cover, since Stage 1 has no snapshot-writer yet (see
+    `core/execution/order_manager.py`'s own docstring point 3) —
+    fabricating an equity figure from `current_cash` would be silently
+    wrong for any date other than "right now," so this surfaces the gap
+    loudly instead; `ChatQueryService` does at most one tool-call round
+    trip (not the full Anthropic multi-turn `tool_result` protocol),
+    since the spec's `LLMClient.generate()` signature carries no
+    conversation history
+- Full test suite in `tests/` — 402 tests passing as of last run (345 prior +
+  57 across `tests/test_ai_assistant/`, all against real local Postgres
+  and/or a real local WebSocket server, no mocks; LLM calls faked)
 
 ## What's NOT built yet (next up)
 - Execution layer Stage 2 (real exchange order placement — Binance
   first, Kraken/Coinbase for US-user coverage) and Stage 3 (live
   trading enablement, API key custody) — both need their own specs
+- Whatever writes `account_snapshots` — nothing does yet (Stage 1
+  gap), which is why `DailySummaryContext` can raise `LookupError` for
+  dates with no snapshot coverage
+- The real-API (non-pytest) integration tests for `LLMClient` mentioned
+  in `docs/ai_assistant_spec.md` section 5 — not run as part of this
+  build, since they cost real money and need a real `ANTHROPIC_API_KEY`
 - SaaS layer — all later phases
 
 ## Commands

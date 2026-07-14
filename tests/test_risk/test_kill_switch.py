@@ -65,11 +65,11 @@ def test_disengage_sets_engaged_false(db):
 
 
 def test_no_auto_clear_path_exists_on_the_class():
-    # KillSwitch exposes exactly engage/disengage/is_engaged/load_state
-    # — no timer, no scheduled task, nothing that could auto-clear an
-    # engaged switch without an explicit disengage() call.
+    # KillSwitch exposes exactly engage/disengage/is_engaged/load_state/
+    # get_state — no timer, no scheduled task, nothing that could
+    # auto-clear an engaged switch without an explicit disengage() call.
     public_methods = {name for name in dir(KillSwitch) if not name.startswith("_")}
-    assert public_methods == {"is_engaged", "engage", "disengage", "load_state"}
+    assert public_methods == {"is_engaged", "engage", "disengage", "load_state", "get_state"}
 
 
 def test_state_survives_reconstruction_simulating_a_process_restart(db):
@@ -106,6 +106,38 @@ def test_scopes_are_independent(db):
 
     assert global_switch.is_engaged() is True
     assert other_switch.is_engaged() is False
+
+
+def test_get_state_returns_full_row_when_never_engaged(db):
+    switch = KillSwitch(db, scope="test_state_fresh")
+    state = switch.get_state()
+    assert state.scope == "test_state_fresh"
+    assert state.engaged is False
+    assert state.engaged_at is None
+    assert state.engaged_reason is None
+    assert state.engaged_by is None
+
+
+def test_get_state_returns_full_row_after_engage(db):
+    switch = KillSwitch(db, scope="test_state_engaged")
+    switch.engage(reason="drawdown tier 3 breach", engaged_by="risk_engine")
+
+    state = switch.get_state()
+
+    assert state.engaged is True
+    assert state.engaged_reason == "drawdown tier 3 breach"
+    assert state.engaged_by == "risk_engine"
+    assert state.engaged_at is not None
+    assert state.updated_at is not None
+
+
+def test_get_state_reflects_a_change_made_by_another_process(db):
+    switch = KillSwitch(db, scope="test_state_reload")
+    other = KillSwitch(db, scope="test_state_reload")
+    other.engage(reason="halt", engaged_by="alice")
+
+    # get_state() re-queries every call, unlike is_engaged()'s cache.
+    assert switch.get_state().engaged is True
 
 
 def test_reengage_updates_reason_and_engaged_by(db):

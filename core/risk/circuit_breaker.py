@@ -46,6 +46,22 @@ class CircuitBreakerEvaluation:
     reason: str | None
 
 
+@dataclass
+class CircuitBreakerStateRecord:
+    """A breaker's last known state, inferred from the most recent
+    circuit_breaker_event_log row for its name. Added for the
+    dashboard's Risk monitoring page — CircuitBreaker itself is a
+    pure in-memory, per-process object (see module docstring), so an
+    API process can only ever observe a breaker's state via this
+    persisted event trail, never by holding its own CircuitBreaker
+    instance in sync with the trading engine's."""
+
+    breaker_name: str
+    tripped: bool
+    reason: str | None
+    occurred_at: datetime
+
+
 class CircuitBreaker:
     def __init__(self, name: str, threshold: float, confirmation_bars: int):
         self.name = name
@@ -121,3 +137,24 @@ def record_circuit_breaker_event(
         },
     )
     db.commit()
+
+
+def get_current_circuit_breaker_states(db: Session) -> list[CircuitBreakerStateRecord]:
+    """The latest event per breaker_name — DISTINCT ON (breaker_name)
+    ordered by occurred_at DESC gives exactly one row per breaker,
+    which is what "currently tripped or clear" means for a breaker
+    whose live state lives only inside a running trading process."""
+    rows = db.execute(text("""
+                SELECT DISTINCT ON (breaker_name) breaker_name, event_type, reason, occurred_at
+                FROM circuit_breaker_event_log
+                ORDER BY breaker_name, occurred_at DESC
+                """)).mappings().all()
+    return [
+        CircuitBreakerStateRecord(
+            breaker_name=row["breaker_name"],
+            tripped=row["event_type"] == "tripped",
+            reason=row["reason"],
+            occurred_at=row["occurred_at"],
+        )
+        for row in rows
+    ]

@@ -64,6 +64,24 @@ class PaperExecutionAdapter(ExecutionAdapter):
         self._orders: dict[str, Order] = {}
         self._fills: dict[str, list[Fill]] = defaultdict(list)
 
+    def load_order(self, order: Order) -> None:
+        """Seeds this adapter's in-memory cache from an already-
+        persisted order this SPECIFIC instance never itself submitted.
+
+        Added for the dashboard's cancel-order control action
+        (docs/dashboard_ui_spec.md section 11): Stage 1's adapter was
+        built assuming one long-lived process handles submit->cancel
+        for an order's whole lifecycle, sharing one in-memory
+        `self._orders` cache throughout. A stateless HTTP API process
+        constructs a fresh adapter per request and never called
+        submit_order() itself, so cancel_order()'s `_require_order()`
+        would always KeyError without this — the adapter has no way to
+        know an order exists otherwise. This does not change any
+        transition/fill logic; it only rehydrates state cancel_order()
+        already expects to find in the cache, from the same Postgres
+        row core/execution/order_reader.py already reads."""
+        self._orders[order.client_order_id] = order
+
     def submit_order(self, order: Order) -> Order:
         if order.client_order_id in self._orders:
             return self._orders[order.client_order_id]

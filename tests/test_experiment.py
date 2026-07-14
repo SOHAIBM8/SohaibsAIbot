@@ -128,6 +128,28 @@ def test_risk_config_id_defaults_to_null(tracker, cleanup):
     assert result.config.risk_config_id is None
 
 
+def test_list_experiments_returns_most_recent_first(tracker, cleanup):
+    id_a = tracker.start(make_config(code_commit_hash="commit_a"))
+    id_b = tracker.start(make_config(code_commit_hash="commit_b"))
+    cleanup.extend([id_a, id_b])
+
+    results = tracker.list_experiments(limit=2)
+
+    ids_in_order = [r.experiment_id for r in results if r.experiment_id in (id_a, id_b)]
+    assert ids_in_order == [id_b, id_a]
+
+
+def test_list_experiments_respects_limit_and_offset(tracker, cleanup):
+    ids = [tracker.start(make_config(code_commit_hash=f"commit_{i}")) for i in range(3)]
+    cleanup.extend(ids)
+
+    first_page = tracker.list_experiments(limit=1, offset=0)
+    second_page = tracker.list_experiments(limit=1, offset=1)
+
+    assert first_page[0].experiment_id == ids[2]
+    assert second_page[0].experiment_id == ids[1]
+
+
 def test_risk_config_id_round_trips(db, tracker):
     db.execute(text("""
             INSERT INTO risk_config (risk_config_id, version)

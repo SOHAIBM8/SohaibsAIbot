@@ -10,7 +10,11 @@ import pytest
 from sqlalchemy import text
 
 from core.db import SessionLocal
-from core.risk.circuit_breaker import CircuitBreaker, record_circuit_breaker_event
+from core.risk.circuit_breaker import (
+    CircuitBreaker,
+    get_current_circuit_breaker_states,
+    record_circuit_breaker_event,
+)
 
 
 @pytest.fixture
@@ -103,7 +107,7 @@ def db():
     finally:
         session.rollback()
         session.execute(
-            text("DELETE FROM circuit_breaker_event_log WHERE breaker_name = 'test_persisted'")
+            text("DELETE FROM circuit_breaker_event_log WHERE breaker_name LIKE 'test_%'")
         )
         session.commit()
         session.close()
@@ -125,3 +129,28 @@ def test_record_circuit_breaker_event_persists_a_row(db):
     )
     assert row["event_type"] == "tripped"
     assert row["reason"] == "value=0.96 >= 0.95"
+
+
+def test_get_current_states_returns_latest_event_per_breaker(db):
+    record_circuit_breaker_event(
+        db, breaker_name="test_a", event_type="tripped", reason="first trip"
+    )
+    record_circuit_breaker_event(db, breaker_name="test_a", event_type="cleared", reason="cleared")
+    record_circuit_breaker_event(
+        db, breaker_name="test_b", event_type="tripped", reason="still tripped"
+    )
+
+    states = get_current_circuit_breaker_states(db)
+    by_name = {s.breaker_name: s for s in states if s.breaker_name in ("test_a", "test_b")}
+
+    assert by_name["test_a"].tripped is False
+    assert by_name["test_a"].reason == "cleared"
+    assert by_name["test_b"].tripped is True
+    assert by_name["test_b"].reason == "still tripped"
+
+
+def test_get_current_states_empty_when_no_events(db):
+    db.execute(text("DELETE FROM circuit_breaker_event_log WHERE breaker_name LIKE 'test_%'"))
+    db.commit()
+    states = get_current_circuit_breaker_states(db)
+    assert all(s.breaker_name not in ("test_a", "test_b") for s in states)

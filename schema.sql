@@ -606,3 +606,68 @@ CREATE TABLE credential_revocation (
     re_granted_at                  TIMESTAMPTZ,
     re_granted_by                     TEXT
 );
+
+-- =====================================================================
+-- Dashboard / Web UI (docs/dashboard_ui_spec.md)
+-- =====================================================================
+
+-- Step 1: single-operator session auth (open decision #1, confirmed
+-- with the user: server-side session table, not stateless JWT — same
+-- "persist important state, revoke by deleting a row" discipline as
+-- kill_switch_state/credential_revocation). Only a HASH of the raw
+-- session token is stored, matching credential_audit_log's "the
+-- sensitive value itself is never the thing persisted" pattern — a
+-- stolen DB dump alone can't be replayed as a valid session cookie.
+CREATE TABLE dashboard_sessions (
+    session_id       TEXT PRIMARY KEY,   -- sha256 hex digest of the raw token
+    account_id         TEXT NOT NULL,
+    created_at            TIMESTAMPTZ NOT NULL,
+    last_active_at          TIMESTAMPTZ NOT NULL,
+    expires_at                TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_dashboard_sessions_expires_at ON dashboard_sessions (expires_at);
+
+-- Step 9: per-account notification channel preferences (spec section
+-- 18, anticipated in spec section 27's "New: ... a notification_preferences
+-- table"). No FK to paper_accounts — same reasoning as dashboard_sessions
+-- above: a dashboard account_id can exist (and have preferences) before
+-- any paper trading account row does. Severity/event-type selection
+-- itself is NOT modeled here as a separate table — "which of the
+-- backend's own event types trigger a notification" reuses the fixed,
+-- small set of boolean columns below rather than a second taxonomy,
+-- per spec section 18: "the frontend does not invent its own severity
+-- taxonomy."
+-- Step 10: persisted notification history. PostgresEventBus.publish()
+-- (core/ingestion/event_bus.py) does nothing but `pg_notify` — LISTEN/
+-- NOTIFY has zero history/persistence of its own; a notification with
+-- no listener currently connected is gone forever. This table exists
+-- so the dashboard's Notifications feed has something to page through
+-- on load, not just events that happen to arrive while a browser tab
+-- is open. Not account-scoped (no account_id column) — every event
+-- type this feeds from (kill switch, circuit breakers, credential
+-- validation) is already global/system-wide in this single-operator
+-- V1, same reasoning as Step 4's risk endpoints having no account
+-- filter.
+CREATE TABLE notification_log (
+    id           BIGSERIAL PRIMARY KEY,
+    event_type     TEXT NOT NULL,
+    severity         TEXT NOT NULL,
+    message            TEXT NOT NULL,
+    payload               JSONB NOT NULL,
+    occurred_at             TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX idx_notification_log_occurred_at ON notification_log (occurred_at DESC);
+
+CREATE TABLE notification_preferences (
+    account_id                            TEXT PRIMARY KEY,
+    email_enabled                           BOOLEAN NOT NULL DEFAULT FALSE,
+    email_address                             TEXT,
+    webhook_enabled                             BOOLEAN NOT NULL DEFAULT FALSE,
+    webhook_url                                   TEXT,
+    notify_on_kill_switch                           BOOLEAN NOT NULL DEFAULT TRUE,
+    notify_on_credential_validation_failed            BOOLEAN NOT NULL DEFAULT TRUE,
+    notify_on_drawdown_breach                           BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at                                            TIMESTAMPTZ NOT NULL
+);

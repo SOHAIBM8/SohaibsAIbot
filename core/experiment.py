@@ -26,6 +26,7 @@ from typing import cast
 
 import structlog
 from sqlalchemy import CursorResult, text
+from sqlalchemy.engine import RowMapping
 from sqlalchemy.orm import Session
 
 logger = structlog.get_logger(__name__)
@@ -164,6 +165,31 @@ class ExperimentTracker:
         self.db.commit()
         logger.info("experiment_finished", experiment_id=experiment_id)
 
+    def list_experiments(self, limit: int = 50, offset: int = 0) -> list[ExperimentResult]:
+        """Most-recent-first page of experiments — added for the
+        dashboard's experiment browser (docs/dashboard_ui_spec.md
+        section 15), which needs to list runs before a caller knows
+        any experiment_id to pass to compare(). Reuses compare()'s own
+        row-to-ExperimentResult mapping via a shared helper so the two
+        never drift apart."""
+        rows = (
+            self.db.execute(
+                text("""
+                SELECT experiment_id, strategy_ids, symbol, timeframe, date_start,
+                       date_end, feature_pipeline_version, fee_bps, slippage_model,
+                       code_commit_hash, started_at, finished_at, metrics,
+                       equity_curve_path, notes, risk_config_id
+                FROM experiments
+                ORDER BY started_at DESC
+                LIMIT :limit OFFSET :offset
+                """),
+                {"limit": limit, "offset": offset},
+            )
+            .mappings()
+            .all()
+        )
+        return [self._row_to_result(row) for row in rows]
+
     def compare(self, experiment_ids: list[int]) -> ComparisonTable:
         """e.g. compare(ema_cross_v1_id, ema_cross_v2_id) side by side
         without the two runs' results ever getting mixed together."""
@@ -186,26 +212,26 @@ class ExperimentTracker:
             .all()
         )
 
-        results = [
-            ExperimentResult(
-                experiment_id=row["experiment_id"],
-                config=ExperimentConfig(
-                    strategy_ids=row["strategy_ids"],
-                    symbol=row["symbol"],
-                    timeframe=row["timeframe"],
-                    date_range=(row["date_start"].isoformat(), row["date_end"].isoformat()),
-                    feature_pipeline_version=row["feature_pipeline_version"],
-                    fee_bps=float(row["fee_bps"]) if row["fee_bps"] is not None else 0.0,
-                    slippage_model=row["slippage_model"],
-                    code_commit_hash=row["code_commit_hash"],
-                    risk_config_id=row["risk_config_id"],
-                ),
-                started_at=row["started_at"],
-                finished_at=row["finished_at"],
-                metrics=row["metrics"] or {},
-                equity_curve_path=row["equity_curve_path"],
-                notes=row["notes"] or "",
-            )
-            for row in rows
-        ]
-        return ComparisonTable(results=results)
+        return ComparisonTable(results=[self._row_to_result(row) for row in rows])
+
+    @staticmethod
+    def _row_to_result(row: RowMapping) -> ExperimentResult:
+        return ExperimentResult(
+            experiment_id=row["experiment_id"],
+            config=ExperimentConfig(
+                strategy_ids=row["strategy_ids"],
+                symbol=row["symbol"],
+                timeframe=row["timeframe"],
+                date_range=(row["date_start"].isoformat(), row["date_end"].isoformat()),
+                feature_pipeline_version=row["feature_pipeline_version"],
+                fee_bps=float(row["fee_bps"]) if row["fee_bps"] is not None else 0.0,
+                slippage_model=row["slippage_model"],
+                code_commit_hash=row["code_commit_hash"],
+                risk_config_id=row["risk_config_id"],
+            ),
+            started_at=row["started_at"],
+            finished_at=row["finished_at"],
+            metrics=row["metrics"] or {},
+            equity_curve_path=row["equity_curve_path"],
+            notes=row["notes"] or "",
+        )

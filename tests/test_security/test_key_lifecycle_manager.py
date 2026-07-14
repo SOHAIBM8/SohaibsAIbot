@@ -218,3 +218,28 @@ def test_sweep_rotation_due_ignores_credentials_not_yet_due(db, vault):
 
     assert swept == []
     assert manager.get(credential_id).state == CredentialState.ACTIVE
+
+
+def test_list_for_account_returns_only_that_accounts_credentials(db, vault):
+    manager = make_manager(db, vault)
+    mine = manager.register(
+        account_id=ACCOUNT_ID, exchange="binance", api_key="k", api_secret="s", mainnet=False
+    )
+    other_account = "test_klm_other_account"
+    manager.register(
+        account_id=other_account, exchange="binance", api_key="k2", api_secret="s2", mainnet=False
+    )
+    try:
+        results = manager.list_for_account(ACCOUNT_ID)
+        assert [c.credential_id for c in results] == [mine]
+    finally:
+        db.execute(
+            text("DELETE FROM encrypted_credentials WHERE account_id = :a"),
+            {"a": other_account},
+        )
+        db.commit()
+
+
+def test_list_for_account_returns_empty_list_when_none_registered(db, vault):
+    manager = make_manager(db, vault)
+    assert manager.list_for_account("test_klm_nobody") == []

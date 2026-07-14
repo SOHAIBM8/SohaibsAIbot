@@ -16,6 +16,7 @@ regardless. Auto-flatten (closing existing positions) is a separate,
 opt-in RiskConfig flag this class doesn't implement.
 """
 
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import structlog
@@ -23,6 +24,21 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 logger = structlog.get_logger(__name__)
+
+
+@dataclass
+class KillSwitchState:
+    """Full persisted row, not just the engaged bool — added for the
+    dashboard's Risk monitoring page (docs/dashboard_ui_spec.md
+    section 14), which needs to show who engaged it, when, and why,
+    not just a boolean."""
+
+    scope: str
+    engaged: bool
+    engaged_at: datetime | None
+    engaged_reason: str | None
+    engaged_by: str | None
+    updated_at: datetime | None
 
 
 class KillSwitch:
@@ -49,6 +65,40 @@ class KillSwitch:
 
     def is_engaged(self) -> bool:
         return self._engaged
+
+    def get_state(self) -> KillSwitchState:
+        """Full row for display — reads fresh from Postgres rather than
+        the cached `_engaged` bool, so a status page always reflects
+        the latest persisted state even if another process engaged/
+        disengaged since this instance was constructed."""
+        row = (
+            self.db.execute(
+                text("""
+                    SELECT scope, engaged, engaged_at, engaged_reason, engaged_by, updated_at
+                    FROM kill_switch_state WHERE scope = :scope
+                    """),
+                {"scope": self.scope},
+            )
+            .mappings()
+            .first()
+        )
+        if row is None:
+            return KillSwitchState(
+                scope=self.scope,
+                engaged=False,
+                engaged_at=None,
+                engaged_reason=None,
+                engaged_by=None,
+                updated_at=None,
+            )
+        return KillSwitchState(
+            scope=row["scope"],
+            engaged=bool(row["engaged"]),
+            engaged_at=row["engaged_at"],
+            engaged_reason=row["engaged_reason"],
+            engaged_by=row["engaged_by"],
+            updated_at=row["updated_at"],
+        )
 
     def engage(self, reason: str, engaged_by: str) -> None:
         now = datetime.now(UTC)

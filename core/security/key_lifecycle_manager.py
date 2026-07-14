@@ -33,6 +33,7 @@ from enum import Enum
 
 import structlog
 from sqlalchemy import text
+from sqlalchemy.engine import RowMapping
 from sqlalchemy.orm import Session
 
 from core.ingestion.event_bus import EventBus
@@ -171,6 +172,30 @@ class KeyLifecycleManager:
         )
         if row is None:
             raise KeyError(f"no encrypted_credentials row with credential_id={credential_id}")
+        return self._row_to_credential(row)
+
+    def list_for_account(self, account_id: str) -> list[EncryptedCredential]:
+        """Added for the dashboard's Settings page (docs/dashboard_ui_spec.md
+        section 17) — no prior caller needed to list every credential
+        for an account at once, only look one up by id."""
+        rows = (
+            self.db.execute(
+                text("""
+                    SELECT credential_id, account_id, exchange, encrypted_api_key,
+                           encrypted_api_secret, wrapped_dek, kek_key_id, state, mainnet,
+                           created_at, last_validated_at, last_rotated_at, rotation_due_at
+                    FROM encrypted_credentials WHERE account_id = :account_id
+                    ORDER BY created_at DESC
+                    """),
+                {"account_id": account_id},
+            )
+            .mappings()
+            .all()
+        )
+        return [self._row_to_credential(row) for row in rows]
+
+    @staticmethod
+    def _row_to_credential(row: RowMapping) -> EncryptedCredential:
         return EncryptedCredential(
             credential_id=row["credential_id"],
             account_id=row["account_id"],

@@ -151,6 +151,42 @@ def test_sell_order_direction_is_passed_through_to_fill_simulator():
     assert adapter.get_fills("co-1")[0].fill_price < 100.0
 
 
+def test_load_order_allows_cancel_on_an_adapter_that_never_submitted_it():
+    """The dashboard's cancel-order endpoint constructs a fresh adapter
+    per request — this proves that adapter can still cancel an order a
+    DIFFERENT (earlier) adapter instance originally submitted, once
+    rehydrated via load_order()."""
+    adapter = make_adapter()
+    order = make_order()
+    order.state = OrderState.SUBMITTED  # as it would be, read back from Postgres
+
+    adapter.load_order(order)
+    result = adapter.cancel_order("co-1")
+
+    assert result.state == OrderState.CANCELLED
+
+
+def test_load_order_then_cancel_on_a_filled_order_still_raises():
+    adapter = make_adapter()
+    order = make_order()
+    order.state = OrderState.FILLED
+
+    adapter.load_order(order)
+
+    with pytest.raises(ValueError, match="illegal order state transition"):
+        adapter.cancel_order("co-1")
+
+
+def test_load_order_also_makes_get_order_status_work():
+    adapter = make_adapter()
+    order = make_order()
+    order.state = OrderState.SUBMITTED
+
+    adapter.load_order(order)
+
+    assert adapter.get_order_status("co-1").state == OrderState.SUBMITTED
+
+
 class _RecordingEventBus:
     def __init__(self):
         self.published = []

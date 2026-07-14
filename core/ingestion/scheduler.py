@@ -46,8 +46,10 @@ from core.ingestion.watermark import get_watermark
 if TYPE_CHECKING:
     # Import only for type checking — avoids ingestion (an already-
     # complete, ai_assistant-agnostic component) gaining a hard runtime
-    # dependency on core.ai_assistant just to type-hint an optional param.
+    # dependency on core.ai_assistant/core.execution just to type-hint
+    # optional params.
     from core.ai_assistant.daily_summary_job import DailySummaryJob
+    from core.execution.reconciliation_job import ReconciliationJob
 
 logger = structlog.get_logger(__name__)
 
@@ -62,6 +64,7 @@ class SweepSummary:
     data_quality_runs: list[str] = field(default_factory=list)
     gap_repairs_run: list[str] = field(default_factory=list)
     daily_summaries_run: list[str] = field(default_factory=list)
+    reconciliations_run: int = 0
 
 
 class Scheduler:
@@ -72,12 +75,14 @@ class Scheduler:
         config: IngestionConfig,
         event_bus: EventBus | None = None,
         daily_summary_job: "DailySummaryJob | None" = None,
+        reconciliation_job: "ReconciliationJob | None" = None,
     ):
         self.db = db
         self.adapters = adapters
         self.config = config
         self.event_bus = event_bus
         self.daily_summary_job = daily_summary_job
+        self.reconciliation_job = reconciliation_job
         self._stop = threading.Event()
 
     def run_once(self, now: datetime | None = None) -> SweepSummary:
@@ -141,6 +146,12 @@ class Scheduler:
 
         if self.daily_summary_job is not None:
             self._run_daily_summaries(summary, now)
+
+        # ReconciliationJob enforces its own 60s (configurable) cadence
+        # via is_due() — the sweep itself may run more often than that.
+        if self.reconciliation_job is not None and self.reconciliation_job.is_due(now):
+            results = self.reconciliation_job.run_once(now)
+            summary.reconciliations_run = len(results)
 
         return summary
 

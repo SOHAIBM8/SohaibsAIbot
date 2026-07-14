@@ -18,6 +18,18 @@ synchronous public interface" shape already established by
 PostgresEventBus (core/ingestion/event_bus.py) for LISTEN/NOTIFY,
 rather than introducing asyncio as a calling convention anywhere else
 in an otherwise fully synchronous codebase.
+
+Design note (rule 9, added for docs/execution_engine_stage2_spec.md
+step 4): `on_open` is an optional callback invoked once per successful
+connection (including every reconnect), returning a message to send
+immediately after connecting. Added because Binance deprecated its
+listenKey-based user data stream (REST `POST /api/v3/userDataStream`,
+confirmed returning 410 Gone against real testnet during this build)
+in favor of a signed subscription sent as the FIRST message over the
+WebSocket API connection itself — a plain "connect to a
+pre-authorized URL" model no longer covers this. Kept generic (any
+caller-supplied message, not Binance-specific) since this class has no
+business knowing about Binance's request shapes.
 """
 
 import asyncio
@@ -42,10 +54,12 @@ class WebSocketConnection:
         max_backoff_s: float = 30.0,
         connect_timeout_s: float = 10.0,
         rand: Callable[[], float] | None = None,
+        on_open: Callable[[], str] | None = None,
     ):
         self.url = url
         self.on_message = on_message
         self.heartbeat_timeout_s = heartbeat_timeout_s
+        self.on_open = on_open
         self.base_backoff_s = base_backoff_s
         self.max_backoff_s = max_backoff_s
         # Deliberately separate from heartbeat_timeout_s: connecting and
@@ -133,6 +147,11 @@ class WebSocketConnection:
             self._alive = True
             self._last_message_at = time.monotonic()
             self._attempt = 0  # a successful connection resets backoff
+            if self.on_open is not None:
+                # Fires on every successful connection, including
+                # reconnects — a fresh connection needs a fresh
+                # subscribe/auth message just as much as the first one.
+                await ws.send(self.on_open())
             try:
                 while not self._stop.is_set():
                     try:

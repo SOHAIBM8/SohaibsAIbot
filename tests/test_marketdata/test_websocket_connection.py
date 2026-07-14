@@ -31,6 +31,59 @@ def test_receives_messages_and_reports_alive(fake_server):
         conn.close()
 
 
+def test_on_open_sends_a_message_immediately_after_connecting(fake_server):
+    received_by_server = []
+
+    async def handler(ws):
+        received_by_server.append(await ws.recv())
+        await asyncio.Future()  # keep the connection open indefinitely
+
+    server = fake_server(handler)
+    conn = WebSocketConnection(
+        url=f"ws://localhost:{server.port}",
+        on_message=lambda m: None,
+        heartbeat_timeout_s=5.0,
+        on_open=lambda: "hello from client",
+    )
+    conn.connect()
+    try:
+        assert wait_until(lambda: received_by_server == ["hello from client"])
+    finally:
+        conn.close()
+
+
+def test_on_open_fires_again_on_every_reconnect(fake_server):
+    received_by_server = []
+
+    async def handler(ws):
+        received_by_server.append(await ws.recv())
+        # returning ends this connection — the next connection gets a
+        # fresh handler call, proving a real reconnect happened.
+
+    server = fake_server(handler)
+    open_count = {"n": 0}
+
+    def on_open():
+        open_count["n"] += 1
+        return f"open-{open_count['n']}"
+
+    conn = WebSocketConnection(
+        url=f"ws://localhost:{server.port}",
+        on_message=lambda m: None,
+        heartbeat_timeout_s=5.0,
+        base_backoff_s=0.05,
+        max_backoff_s=0.2,
+        rand=lambda: 0.0,
+        on_open=on_open,
+    )
+    conn.connect()
+    try:
+        assert wait_until(lambda: len(received_by_server) >= 2, timeout_s=15.0)
+        assert received_by_server[:2] == ["open-1", "open-2"]
+    finally:
+        conn.close()
+
+
 def test_is_alive_false_before_connecting():
     conn = WebSocketConnection(
         url="ws://localhost:1", on_message=lambda m: None, heartbeat_timeout_s=1.0

@@ -59,3 +59,53 @@ class PaperFillSimulated(ExecutionEvent):
     simulated_latency_ms: float = 0.0
     occurred_at: datetime | None = None
     event_type: str = "PaperFillSimulated"
+
+
+# --- Stage 2 (docs/execution_engine_stage2_spec.md section 7) ----------
+
+
+@dataclass(frozen=True)
+class OrderAcknowledgedByExchange(ExecutionEvent):
+    client_order_id: str = ""
+    exchange_order_id: str = ""
+    occurred_at: datetime | None = None
+    event_type: str = "OrderAcknowledgedByExchange"
+
+
+@dataclass(frozen=True)
+class ExchangeOrderMismatchDetected(ExecutionEvent):
+    client_order_id: str = ""
+    local_state: str = ""
+    exchange_state: str = ""
+    occurred_at: datetime | None = None
+    event_type: str = "ExchangeOrderMismatchDetected"
+
+
+@dataclass(frozen=True)
+class ExchangeOrderCorrected(ExecutionEvent):
+    client_order_id: str = ""
+    local_state: str = ""
+    exchange_state: str = ""
+    occurred_at: datetime | None = None
+    event_type: str = "ExchangeOrderCorrected"
+
+
+@dataclass(frozen=True)
+class ListenKeyRenewed(ExecutionEvent):
+    occurred_at: datetime | None = None
+    event_type: str = "ListenKeyRenewed"
+
+
+@dataclass(frozen=True)
+class ListenKeyExpiredReconnecting(ExecutionEvent):
+    occurred_at: datetime | None = None
+    event_type: str = "ListenKeyExpiredReconnecting"
+
+
+@dataclass(frozen=True)
+class ExchangeErrorClassified(ExecutionEvent):
+    category: str = ""
+    binance_code: int = 0
+    message: str = ""
+    occurred_at: datetime | None = None
+    event_type: str = "ExchangeErrorClassified"

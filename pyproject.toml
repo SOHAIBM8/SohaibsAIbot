@@ -52,3 +52,6 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "testnet: real Binance testnet integration tests — require BINANCE_TESTNET_API_KEY/BINANCE_TESTNET_API_SECRET env vars, skipped when absent",
+]

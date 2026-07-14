@@ -468,3 +468,30 @@ ALTER TABLE orders ADD COLUMN account_id TEXT REFERENCES paper_accounts(account_
 -- summary is due, exactly like ingestion_watermark already does for
 -- backfill/gap-scan/data-quality cadence. Additive, nullable.
 ALTER TABLE paper_accounts ADD COLUMN last_daily_summary_at TIMESTAMPTZ;
+
+-- =====================================================================
+-- Live Execution Stage 2 (docs/execution_engine_stage2_spec.md)
+-- Binance TESTNET only. Mainnet credentials, key encryption, and live
+-- trading enablement are Stage 3 and remain entirely unimplemented.
+-- =====================================================================
+
+CREATE TABLE symbol_filters_cache (
+    symbol          TEXT PRIMARY KEY,
+    min_qty          NUMERIC, max_qty NUMERIC, step_size NUMERIC,
+    min_price          NUMERIC, max_price NUMERIC, tick_size NUMERIC,
+    min_notional          NUMERIC,
+    fetched_at              TIMESTAMPTZ NOT NULL
+);
+
+-- One row per reconciliation CHECK (not just per correction) — a
+-- clean check is evidence too, same "no-op runs are logged" ethos as
+-- ingestion_run_log.
+CREATE TABLE reconciliation_log (
+    id                  BIGSERIAL PRIMARY KEY,
+    client_order_id       TEXT NOT NULL REFERENCES orders(client_order_id),
+    local_state             TEXT NOT NULL,
+    exchange_state             TEXT NOT NULL,
+    mismatch                     BOOLEAN NOT NULL,
+    corrected                      BOOLEAN NOT NULL,
+    checked_at                       TIMESTAMPTZ NOT NULL
+);

@@ -86,18 +86,60 @@ so Claude Code can continue that work without needing that conversation.
 - **Binance for development**, but the exchange abstraction must support
   Kraken/Coinbase early — Binance.com is unavailable to US users, and this
   is headed toward a multi-user SaaS.
-- **Live Execution & Paper Trading ships in three stages; only Stage 1
-  is built.** `OrderManager` and the order state machine are IDENTICAL
-  for paper and live — only `ExecutionAdapter` differs, so Stage 2
-  (real exchange order placement) plugs in without touching
-  `OrderManager`. Stage 1 has ZERO exchange authentication and ZERO
-  real order placement — `LiveExecutionAdapter` is an interface stub
-  only, every method raises `NotImplementedError`. **Stage 2 (real
-  exchange adapters) and Stage 3 (live trading enablement, API key
-  custody) are separate, not-yet-specced phases** — do not treat
-  Stage 1 as "the execution layer is done." Every order, paper or
-  live, must originate from an approved `SizingDecision` — no code
-  path places an order without Risk Engine approval.
+- **Live Execution & Paper Trading ships in three stages; Stages 1 and
+  2 are built, Stage 3 is not.** `OrderManager` and the order state
+  machine are IDENTICAL for paper and live — only `ExecutionAdapter`
+  differs; Stage 2's `BinanceExecutionAdapter` required ZERO changes to
+  `OrderManager`, confirming the Stage 1 interface really was
+  adapter-agnostic. **Stage 2 targets Binance TESTNET only.** Mainnet
+  credentials, API key encryption/custody, and any live-trading
+  enablement are Stage 3 and remain entirely unimplemented — do not
+  treat Stage 2 as "trading is live." Testnet credentials are read from
+  `BINANCE_TESTNET_API_KEY`/`BINANCE_TESTNET_API_SECRET` environment
+  variables only, never persisted to Postgres or anywhere else. Every
+  order, paper or live, must originate from an approved
+  `SizingDecision` — no code path places an order without Risk Engine
+  approval.
+- **An ambiguous order-submission failure (timeout, connection drop)
+  is never assumed to be a failure.** `BinanceExecutionAdapter` queries
+  the exchange for the existing `client_order_id` before ever retrying
+  with a fresh submission — recovering the real outcome if the order
+  actually went through, and only resubmitting once genuinely
+  confirmed absent. A clean HTTP error response (429/503/etc.) is a
+  different case entirely — Binance definitely never created that
+  order, so it's just retried via the existing `RetryPolicy`, no
+  existence check needed. See `core/execution/binance_execution_adapter.py`'s
+  module docstring for the full reasoning.
+- **The REST reconciliation poll is authoritative over the WebSocket
+  stream whenever they disagree.** `BinanceOrderStreamConsumer` is a
+  low-latency notifier only — it forwards `executionReport` fill
+  events straight to `OrderManager.handle_fill()`, the same single
+  fill-handling path paper trading uses, but it is never treated as
+  the source of truth. `ReconciliationJob` polls exchange state on a
+  fixed cadence (60s default) regardless of whether anything seemed
+  wrong, and is the actual arbiter: a mismatch it can correct via a
+  legal state transition is corrected and logged; a mismatch that
+  would require an illegal transition (a genuine anomaly, not
+  staleness) is surfaced and left for a human, never forced.
+- **Binance's listenKey-based user data stream is deprecated — the
+  Stage 2 build discovered this against real testnet, not from docs.**
+  `POST /api/v3/userDataStream` (the original design for obtaining a
+  WebSocket auth key) returned a confirmed `410 Gone` on real testnet;
+  Binance deprecated it in April 2025 with full removal across all
+  environments scheduled for 2026-02-20. The fix, confirmed against
+  Binance's current WebSocket API docs and re-verified end-to-end
+  against real testnet: `BinanceOrderStreamConsumer` now connects
+  directly to the WebSocket API
+  (`wss://ws-api.testnet.binance.vision/ws-api/v3`) and authenticates
+  the stream itself by sending a signed `userDataStream.subscribe.signature`
+  request as the first message — no separate key to obtain, renew, or
+  expire. `core/marketdata/websocket_connection.py`'s `WebSocketConnection`
+  gained a generic `on_open` hook (fires on every connection, including
+  reconnects) to support this — a small, domain-agnostic extension to
+  an already-complete, tested Stage 1 component, not Binance-specific.
+  `ListenKeyManager` (the original Step 4 REST-based key manager) was
+  removed outright rather than kept as unused dead code implementing an
+  API flow that no longer exists.
 - **The AI Analysis & Signal Explanation Engine has zero write access to
   any trading table, enforced at the Postgres role level, not just in
   application code.** `ContextBuilder` and every `ChatTool` connect via
@@ -121,12 +163,12 @@ Foundations → backtesting engine → execution layer → risk engine → SaaS
 multi-tenancy → AI signal research. AI is deliberately last — infra and
 risk discipline come first. Risk engine is built. Execution layer
 Stage 1 (paper trading + shared order state machine + read-only market
-data) is built; Stage 2 (real exchange order placement) and Stage 3
-(live trading enablement, API key custody) are NOT started and need
-their own specs before any work begins on them. The AI Analysis &
-Signal Explanation Engine (all 9 build-order steps) is built, strictly
-downstream/read-only of everything above it — see the dedicated
-write-up below. SaaS multi-tenancy is next, not yet started.
+data) and Stage 2 (real Binance TESTNET order placement) are built;
+Stage 3 (mainnet, API key custody, live trading enablement) is NOT
+started and needs its own spec before any work begins on it. The AI
+Analysis & Signal Explanation Engine (all 9 build-order steps) is
+built, strictly downstream/read-only of everything above it — see the
+dedicated write-up below. SaaS multi-tenancy is next, not yet started.
 
 ## What's built so far
 - `core/strategy_base.py` — `Signal`, `StrategyMeta`, `StrategyBase`, `Regime`, `VolRegime`
@@ -282,6 +324,109 @@ write-up below. SaaS multi-tenancy is next, not yet started.
     else could supply them; no `account_snapshots` writing logic yet
     (nothing in Stage 1's spec assigns that responsibility to any
     class)
+- **Live Execution Stage 2 — Binance TESTNET only** (`core/execution/`,
+  `docs/execution_engine_stage2_spec.md`). Mainnet credentials, key
+  encryption/custody, and live-trading enablement are Stage 3 and are
+  NOT built. Tested against fakes (no real network in the standard
+  suite, matching every other exchange-facing component); a separate
+  `testnet`-marked integration suite makes real testnet calls and is
+  skipped unless `BINANCE_TESTNET_API_KEY`/`BINANCE_TESTNET_API_SECRET`
+  are set — **run against real Binance testnet with real (free,
+  no-value) credentials as part of this build: all 3 tests pass,
+  confirmed stable across two independent runs** (a real market order
+  filled end-to-end, a real limit order was cancelled cleanly, and a
+  real WebSocket fill notification was independently confirmed by
+  REST reconciliation):
+  - `binance_clock_sync.py` — `ClockSyncService`, tracks offset vs.
+    Binance server time, applied to every signed request's timestamp
+  - `binance_symbol_filter_cache.py` — `SymbolFilterCache`, caches
+    `GET /exchangeInfo`; every order pre-validated against
+    `LOT_SIZE`/`PRICE_FILTER`/`MIN_NOTIONAL` before submission, failing
+    closed (rejected locally) if no cached filters exist for a symbol
+  - `binance_error_classifier.py` — `BinanceErrorClassifier`, maps
+    Binance error codes to `retryable`/`category` ('network' |
+    'rate_limit' | 'rejected' | 'fatal' | 'auth') — feeds the existing
+    `RetryableIngestionError`/`FatalIngestionError` taxonomy rather
+    than inventing a second one; 'rejected' becomes `Order` ->
+    `REJECTED` (a normal outcome), never an exception
+  - `binance_execution_adapter.py` — `BinanceExecutionAdapter`,
+    replaces the Stage 1 `LiveExecutionAdapter` stub. Ambiguous
+    submission failures (timeout/connection drop) query the exchange
+    for the existing `client_order_id` BEFORE ever retrying — never
+    assumes failure and resubmits blind (see the architectural-
+    decisions bullet above). `get_order_status()` returns a detached
+    SNAPSHOT of the exchange's view rather than mutating the shared
+    cached `Order` — a design fix made mid-build (rule 9) after
+    realizing an in-place mutation would collide with
+    `OrderManager.handle_fill()`'s sole ownership of fill-driven
+    transitions once `ReconciliationJob` (below) needed to call both
+  - `binance_order_stream_consumer.py` — `BinanceOrderStreamConsumer`.
+    **Rewritten mid-build** after discovering Binance's listenKey REST
+    endpoint (`POST /api/v3/userDataStream`) returns `410 Gone` on real
+    testnet (see the architectural-decisions bullet above for the full
+    story) — it now connects directly to the WebSocket API and
+    authenticates the stream itself with a signed
+    `userDataStream.subscribe.signature` request sent via
+    `WebSocketConnection`'s new `on_open` hook, re-sent on every
+    reconnect. `ListenKeyManager` (the original REST-based key manager)
+    was removed outright, not kept as dead code. Normalizes
+    `executionReport` events (now arriving wrapped as
+    `{"subscriptionId": N, "event": {...}}`) and forwards only actual
+    `TRADE` events to `OrderManager.handle_fill()` — no new fill-
+    handling path; malformed messages and fills for unknown orders are
+    logged, never raised out of the callback
+  - `reconciliation_job.py` — `ReconciliationJob`, adapter-agnostic
+    (depends on `ExecutionAdapter`, not Binance directly), polls every
+    locally-open LIVE order via `get_order_status()` on a configurable
+    cadence (60s default), logs one `reconciliation_log` row per check
+    (clean or not), and corrects mismatches: fill-driven corrections
+    route through `OrderManager.handle_fill()` (the same shared path);
+    exchange-confirmed cancel/reject corrections are applied directly
+    (no `OrderManager` method fits "the exchange already resolved this
+    a different way than we knew"); a mismatch requiring an ILLEGAL
+    transition is published and logged but never forced — left for a
+    human. Wired into the existing ingestion `Scheduler` via an
+    optional, `TYPE_CHECKING`-gated `reconciliation_job` param — same
+    additive pattern as `daily_summary_job`, zero new scheduling
+    mechanism, zero hard runtime dependency added to ingestion
+  - `events.py` gained `OrderAcknowledgedByExchange`,
+    `ExchangeOrderMismatchDetected`, `ExchangeOrderCorrected`,
+    `ExchangeErrorClassified`. `ListenKeyRenewed`/
+    `ListenKeyExpiredReconnecting` were defined per the spec's original
+    literal event list but are now unused — there is no listenKey
+    lifecycle left to emit them for (see the auth-flow rewrite above);
+    left defined rather than removed since nothing currently guarantees
+    the spec's event list is otherwise exhaustive
+  - `core/marketdata/websocket_connection.py`'s `WebSocketConnection`
+    gained a generic `on_open` hook (fires once per connection,
+    including reconnects) to support the signed-subscribe-on-connect
+    auth flow — not Binance-specific, a small extension to an
+    already-complete Stage 1 component
+  - `schema.sql` gained `symbol_filters_cache` (defined per spec;
+    `SymbolFilterCache` currently keeps its cache in memory only —
+    nothing writes this table yet, flagged rather than silently wired
+    up unused) and `reconciliation_log`
+  - Known, deliberate scope limits: only `MARKET` and `LIMIT` order
+    types are implemented — `STOP`/`STOP_LIMIT`/`OCO` raise
+    `FatalIngestionError` rather than being mis-mapped, since their
+    Binance parameter shapes are real additional scope; external/manual
+    trade detection (an exchange order with no matching
+    `client_order_id`) is explicitly deferred to Stage 3, confirmed
+    with the user against the spec's own open decision #1;
+    `SymbolFilterCache` doesn't model `PERCENT_PRICE_BY_SIDE`
+    (price-deviation-from-market) — out of the spec's decision #5 scope
+    (`LOT_SIZE`/`PRICE_FILTER`/`MIN_NOTIONAL` only), discovered when a
+    test limit order priced 50% below market was correctly rejected by
+    the exchange for exactly this reason
+  - **Known gap, not fixed here (forbidden by the spec's own
+    integration point #1 — `OrderManager` must not change for Stage 2
+    to work):** `OrderManager._apply_fill_to_account()` unconditionally
+    writes to `paper_accounts.current_cash` regardless of `order.mode`.
+    This was unreachable in Stage 1 (`LiveExecutionAdapter` always
+    raised `NotImplementedError`) and is now reachable via a real live
+    fill for the first time. Fixing it needs either a mode branch in
+    `OrderManager` (forbidden) or a real live-account-balance model —
+    realistically Stage 3 territory.
 - **AI Analysis & Signal Explanation Engine** (`core/ai_assistant/`,
   `news_sources/`, `docs/ai_assistant_spec.md`) — strictly downstream
   and read-only with respect to every trading table, enforced at the
@@ -355,14 +500,29 @@ write-up below. SaaS multi-tenancy is next, not yet started.
     trip (not the full Anthropic multi-turn `tool_result` protocol),
     since the spec's `LLMClient.generate()` signature carries no
     conversation history
-- Full test suite in `tests/` — 402 tests passing as of last run (345 prior +
-  57 across `tests/test_ai_assistant/`, all against real local Postgres
-  and/or a real local WebSocket server, no mocks; LLM calls faked)
+- Full test suite in `tests/` — 474 tests collected: 471 passing +
+  3 real-testnet-only as of last run, all against real local Postgres
+  and/or a real local WebSocket server, no mocks; LLM calls faked in
+  the standard suite; Binance calls faked in the standard suite except
+  the `testnet`-marked integration suite
+  (`test_binance_testnet_integration.py`, requires
+  `BINANCE_TESTNET_API_KEY`/`BINANCE_TESTNET_API_SECRET` — skipped
+  without them). **That suite was run against real Binance testnet as
+  part of this build and all 3 tests pass**, confirmed stable across
+  two independent runs — see the architectural-decisions bullet above
+  for the real API-deprecation issue (410 Gone on the old listenKey
+  endpoint) it surfaced and how it was fixed.
 
 ## What's NOT built yet (next up)
-- Execution layer Stage 2 (real exchange order placement — Binance
-  first, Kraken/Coinbase for US-user coverage) and Stage 3 (live
-  trading enablement, API key custody) — both need their own specs
+- Execution layer Stage 3 (mainnet credentials, API key
+  encryption/custody, live-trading enablement) — needs its own spec
+- `SymbolFilterCache` doesn't model Binance's `PERCENT_PRICE_BY_SIDE`
+  filter (price-deviation-from-market) — only
+  `LOT_SIZE`/`PRICE_FILTER`/`MIN_NOTIONAL` per the spec's decision #5;
+  a limit order priced far enough from market will be correctly
+  rejected by the exchange (not a crash) but not caught locally first
+- The `paper_accounts.current_cash`-for-live-orders gap flagged above —
+  needs a real live-account-balance model, realistically Stage 3
 - Whatever writes `account_snapshots` — nothing does yet (Stage 1
   gap), which is why `DailySummaryContext` can raise `LookupError` for
   dates with no snapshot coverage

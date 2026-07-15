@@ -205,3 +205,57 @@ def test_backtest_with_kill_switch_engaged_produces_no_trades(db):
     )
     assert len(rows) == 1
     assert rows[0]["rejection_reason"] == "kill_switch_active"
+
+
+def test_backtest_with_data_quality_ok_false_produces_no_trades(db):
+    """docs/gap_audit_report.md P0 #2: RiskContext.data_quality_ok was
+    hardcoded True in every RiskContext BacktestEngine ever built —
+    RejectionReason.DATA_QUALITY_FAILED was reachable in RiskEngine but
+    never actually reachable end-to-end from a real backtest run. Same
+    shape as the kill-switch test above, proving the wiring now works."""
+    risk_engine = make_risk_engine(db)
+    engine = BacktestEngine(
+        strategies=[make_strategy("test_risk_bt_dq", "buy_trigger")],
+        regime_detector=RegimeDetector(RegimeDetectorConfig(min_confirmation_bars=1)),
+        position_sizer=risk_engine,
+        execution_model=ExecutionModel(fee_bps=0, slippage_bps=0),
+        initial_capital=10_000.0,
+        data_quality_ok=False,
+        data_quality_reason="test: simulated bad ingested data",
+    )
+
+    df = base_columns(n=8, trigger_bar=1)
+    result = engine.run(df)
+
+    assert len(result.trades) == 0
+
+    rows = (
+        db.execute(
+            text(
+                "SELECT rejection_reason FROM risk_decision_log "
+                "WHERE strategy_id = 'test_risk_bt_dq@1.0.0'"
+            )
+        )
+        .mappings()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0]["rejection_reason"] == "data_quality_failed"
+
+
+def test_backtest_data_quality_ok_true_by_default_preserves_old_behavior(db):
+    """No caller passes data_quality_ok — confirms the default keeps
+    existing callers/tests working exactly as before this change."""
+    risk_engine = make_risk_engine(db)
+    engine = BacktestEngine(
+        strategies=[make_strategy("test_risk_bt_dq_default", "buy_trigger")],
+        regime_detector=RegimeDetector(RegimeDetectorConfig(min_confirmation_bars=1)),
+        position_sizer=risk_engine,
+        execution_model=ExecutionModel(fee_bps=0, slippage_bps=0),
+        initial_capital=10_000.0,
+    )
+
+    df = base_columns(n=8, trigger_bar=1)
+    result = engine.run(df)
+
+    assert len(result.trades) == 1

@@ -8,21 +8,36 @@ def make_registry_with_chain() -> FeatureRegistry:
     """a depends on nothing, b depends on a, c depends on b — used to
     verify resolve_order and compute() respect dependency ordering."""
     registry = FeatureRegistry()
-    registry.register(FeatureDefinition(
-        name="a", version="v1",
-        formula=lambda df: df["close"] * 2,
-        parameters={}, dependencies=[], last_updated="2026-01-01",
-    ))
-    registry.register(FeatureDefinition(
-        name="b", version="v1",
-        formula=lambda df: df["a"] + 1,
-        parameters={}, dependencies=["a"], last_updated="2026-01-01",
-    ))
-    registry.register(FeatureDefinition(
-        name="c", version="v1",
-        formula=lambda df: df["b"] * 10,
-        parameters={}, dependencies=["b"], last_updated="2026-01-01",
-    ))
+    registry.register(
+        FeatureDefinition(
+            name="a",
+            version="v1",
+            formula=lambda df: df["close"] * 2,
+            parameters={},
+            dependencies=[],
+            last_updated="2026-01-01",
+        )
+    )
+    registry.register(
+        FeatureDefinition(
+            name="b",
+            version="v1",
+            formula=lambda df: df["a"] + 1,
+            parameters={},
+            dependencies=["a"],
+            last_updated="2026-01-01",
+        )
+    )
+    registry.register(
+        FeatureDefinition(
+            name="c",
+            version="v1",
+            formula=lambda df: df["b"] * 10,
+            parameters={},
+            dependencies=["b"],
+            last_updated="2026-01-01",
+        )
+    )
     return registry
 
 
@@ -34,14 +49,26 @@ def test_resolve_order_respects_dependencies():
 
 def test_resolve_order_detects_circular_dependency():
     registry = FeatureRegistry()
-    registry.register(FeatureDefinition(
-        name="x", version="v1", formula=lambda df: df["close"],
-        parameters={}, dependencies=["y"], last_updated="2026-01-01",
-    ))
-    registry.register(FeatureDefinition(
-        name="y", version="v1", formula=lambda df: df["close"],
-        parameters={}, dependencies=["x"], last_updated="2026-01-01",
-    ))
+    registry.register(
+        FeatureDefinition(
+            name="x",
+            version="v1",
+            formula=lambda df: df["close"],
+            parameters={},
+            dependencies=["y"],
+            last_updated="2026-01-01",
+        )
+    )
+    registry.register(
+        FeatureDefinition(
+            name="y",
+            version="v1",
+            formula=lambda df: df["close"],
+            parameters={},
+            dependencies=["x"],
+            last_updated="2026-01-01",
+        )
+    )
     with pytest.raises(ValueError, match="circular"):
         registry.resolve_order(["x"])
 

@@ -7,6 +7,7 @@ from core.strategy_base import Regime, VolRegime
 
 class FakeWindow:
     """Minimal stand-in for FeatureWindow — just needs .get()."""
+
     def __init__(self, **values):
         self._values = values
 
@@ -43,6 +44,7 @@ def sideways_window(adx=10.0, atr_pct=0.5):
 
 # --- trend classification -------------------------------------------------
 
+
 def test_bull_trend_requires_ema_alignment_and_sufficient_adx(detector):
     # min_confirmation_bars=3 in the fixture config — feed 3 agreeing
     # bars so hysteresis actually confirms the new regime.
@@ -73,6 +75,7 @@ def test_trend_confidence_increases_with_adx(config):
 
 # --- volatility classification --------------------------------------------
 
+
 def test_high_atr_percentile_classified_high_vol(detector):
     for _ in range(3):
         state = detector.classify(bull_window(atr_pct=0.85))
@@ -91,6 +94,7 @@ def test_mid_atr_percentile_classified_normal_vol(detector):
 
 
 # --- hysteresis -------------------------------------------------------------
+
 
 def test_single_bar_flip_does_not_change_confirmed_trend(detector):
     """Starts SIDEWAYS by default. One bull bar alone shouldn't be
@@ -129,6 +133,7 @@ def test_reset_clears_pending_and_confirmed_state(detector):
 
 
 # --- config loading ----------------------------------------------------------
+
 
 def test_config_loads_from_yaml(tmp_path):
     config_file = tmp_path / "regime.yaml"

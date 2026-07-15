@@ -18,8 +18,8 @@ this splitter is deliberately structured so that extension doesn't
 require rewriting it.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import pandas as pd
 
@@ -66,11 +66,13 @@ def run_walk_forward(
         engine = engine_factory()
         result = engine.run(window_df)
         metrics = compute_metrics(result.trades, result.equity_curve, periods_per_year)
-        results.append(WalkForwardWindow(
-            window_index=i,
-            test_start=window_df.index[0],
-            test_end=window_df.index[-1],
-            result=result,
-            metrics=metrics,
-        ))
+        results.append(
+            WalkForwardWindow(
+                window_index=i,
+                test_start=window_df.index[0],
+                test_end=window_df.index[-1],
+                result=result,
+                metrics=metrics,
+            )
+        )
     return results

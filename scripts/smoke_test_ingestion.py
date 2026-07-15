@@ -41,8 +41,10 @@ def main() -> None:
     print(f"[2/6] Fetching last 48h of real {SYMBOL} {TIMEFRAME} candles from Binance...")
     start = now - timedelta(hours=48)
     candles = adapter.fetch_klines(SYMBOL, TIMEFRAME, start, now, limit=100)
-    print(f"      fetched {len(candles)} candles, first={candles[0].open_time}, "
-          f"last={candles[-1].open_time}")
+    print(
+        f"      fetched {len(candles)} candles, first={candles[0].open_time}, "
+        f"last={candles[-1].open_time}"
+    )
 
     print("[3/6] Validating with CandleValidator...")
     result = validate_candles(candles, TIMEFRAME, now)
@@ -71,7 +73,10 @@ def main() -> None:
     )
     inserted = upsert_candles(db, EXCHANGE, SYMBOL, TIMEFRAME, result.valid, run_id)
     upsert_watermark(
-        db, EXCHANGE, SYMBOL, TIMEFRAME,
+        db,
+        EXCHANGE,
+        SYMBOL,
+        TIMEFRAME,
         earliest_available_at=start,
         last_ingested_open_time=max(c.open_time for c in result.valid),
         backfill_complete=True,
@@ -80,7 +85,9 @@ def main() -> None:
 
     print("[5/6] Running GapDetectionService against the real ingested range...")
     gap_result = GapDetectionService(db).run(EXCHANGE, SYMBOL, TIMEFRAME, now=now)
-    print(f"      gaps_found={len(gap_result.gaps_found)} skipped_reason={gap_result.skipped_reason}")
+    print(
+        f"      gaps_found={len(gap_result.gaps_found)} skipped_reason={gap_result.skipped_reason}"
+    )
 
     print("[6/6] Running DataQualityService with a live cross-check against Binance...")
     dq_report = DataQualityService(db, config, adapter=adapter).run(
@@ -112,13 +119,17 @@ def main() -> None:
         {"e": EXCHANGE, "s": SYMBOL, "t": TIMEFRAME},
     )
     db.execute(
-        text("DELETE FROM ingestion_run_log WHERE exchange = :e AND symbol = :s AND timeframe = :t"),
+        text(
+            "DELETE FROM ingestion_run_log WHERE exchange = :e AND symbol = :s AND timeframe = :t"
+        ),
         {"e": EXCHANGE, "s": SYMBOL, "t": TIMEFRAME},
     )
     db.commit()
     db.close()
-    print("Done. SUCCESS: real Binance backfill -> validate -> store -> gap scan -> data "
-          "quality (with live cross-check) all ran end-to-end.")
+    print(
+        "Done. SUCCESS: real Binance backfill -> validate -> store -> gap scan -> data "
+        "quality (with live cross-check) all ran end-to-end."
+    )
 
 
 if __name__ == "__main__":

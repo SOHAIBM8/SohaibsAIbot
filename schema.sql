@@ -360,6 +360,24 @@ CREATE TABLE account_snapshots (
     snapshot_at                 TIMESTAMPTZ NOT NULL
 );
 
+-- Live/testnet account cash tracking — kept in a SEPARATE table from
+-- paper_accounts, not a shared row keyed only by account_id. Fixes a
+-- real gap (docs/gap_audit_report.md P0 #1): OrderManager's fill
+-- handler was unconditionally writing every fill's cash delta into
+-- paper_accounts.current_cash regardless of order.mode, silently
+-- mixing simulated paper P&L with real testnet/live P&L in one ledger
+-- — this was reachable the moment Stage 2's BinanceExecutionAdapter
+-- started producing real live fills, and would have made both paper
+-- and testnet figures untrustworthy during the soak period. Same
+-- column shape as paper_accounts by design (OrderManager.mode picks
+-- which table to route a fill to, both tables otherwise identical).
+CREATE TABLE live_accounts (
+    account_id          TEXT PRIMARY KEY,
+    starting_balance     NUMERIC NOT NULL,
+    current_cash          NUMERIC NOT NULL,
+    created_at             TIMESTAMPTZ NOT NULL
+);
+
 -- =====================================================================
 -- AI Analysis & Signal Explanation Engine (docs/ai_assistant_spec.md)
 -- Strictly downstream and read-only w.r.t. every trading table above —
@@ -458,9 +476,19 @@ GRANT SELECT ON news_articles TO llm_readonly;
 -- see its own module docstring point 2), but ContextBuilder.
 -- build_daily_summary_context() is account-scoped and has no other way
 -- to determine which orders belong to which paper account. Additive,
--- nullable (a live-mode order in a future stage may have no paper
--- account at all) — same pattern as `experiments.risk_config_id`.
-ALTER TABLE orders ADD COLUMN account_id TEXT REFERENCES paper_accounts(account_id);
+-- nullable — same pattern as `experiments.risk_config_id`.
+--
+-- No FK to paper_accounts specifically (revised — docs/gap_audit_report.md
+-- P0 #1): this comment originally anticipated "a live-mode order in a
+-- future stage may have no paper account at all" and left the column
+-- nullable for exactly that reason, but a single-table FK still forced
+-- every order's account_id to exist in paper_accounts even once
+-- live_accounts existed. account_id now identifies a row in EITHER
+-- paper_accounts or live_accounts depending on the order's own mode —
+-- existence is validated by OrderManager at write time (it always
+-- upserts the correct account before a fill needs it), not by a DB
+-- constraint that can only point at one table.
+ALTER TABLE orders ADD COLUMN account_id TEXT;
 
 -- Step 5: DailySummaryJob is "triggered by the existing Scheduler, not
 -- a new scheduling mechanism" — Scheduler.run_once() needs a per-

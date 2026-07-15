@@ -2,7 +2,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+
+from core.feature_store import FeatureRegistry, FeatureWindow
 
 
 class Regime(Enum):
@@ -29,18 +30,19 @@ class Signal:
     them based on account-level risk limits before anything reaches an
     exchange.
     """
-    direction: int                  # 1 long, -1 short, 0 flat
+
+    direction: int  # 1 long, -1 short, 0 flat
     entry_price: float
-    stop_loss: Optional[float]
-    take_profit: Optional[float]
-    strategy_id: str                # "ema_cross@1.0.0"
-    signal_strength: float          # 0-1, strategy's own deterministic
-                                     # conviction (e.g. crossover gap size) —
-                                     # NOT a probability estimate
-    reasons: list[str] = field(default_factory=list)            # why generated
-    rejected_reasons: list[str] = field(default_factory=list)   # near-miss log
+    stop_loss: float | None
+    take_profit: float | None
+    strategy_id: str  # "ema_cross@1.0.0"
+    signal_strength: float  # 0-1, strategy's own deterministic
+    # conviction (e.g. crossover gap size) —
+    # NOT a probability estimate
+    reasons: list[str] = field(default_factory=list)  # why generated
+    rejected_reasons: list[str] = field(default_factory=list)  # near-miss log
     metadata: dict = field(default_factory=dict)
-    generated_at: Optional[datetime] = None
+    generated_at: datetime | None = None
 
 
 @dataclass
@@ -66,14 +68,14 @@ class StrategyBase(ABC):
     min_lookback: int
 
     @abstractmethod
-    def generate_signal(self, feature_window: "FeatureWindow") -> Signal:
+    def generate_signal(self, feature_window: FeatureWindow) -> Signal:
         """Pure function: same input always produces the same output.
         No I/O, no wall-clock reads, no hidden state. This purity is what
         makes backtest and live execution call the same code path, which
         is what makes backtest results trustworthy in the first place."""
         ...
 
-    def validate(self, feature_registry: "FeatureRegistry") -> list[str]:
+    def validate(self, feature_registry: FeatureRegistry) -> list[str]:
         errors = []
         for f in self.required_features:
             if not feature_registry.has(f):

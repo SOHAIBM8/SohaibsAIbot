@@ -12,25 +12,55 @@ strategy implementation.
 """
 
 from dataclasses import dataclass
-from core.strategy_base import Signal, Regime
+from typing import Protocol
+
+from core.feature_store import FeatureWindow
+from core.regime_detector import RegimeDetector
+from core.strategy_base import Regime, Signal, VolRegime
+
+
+class PerformanceHistory(Protocol):
+    """Shape ConfidenceEngine needs back from a performance store query
+    — narrow on purpose, matching this project's established Protocol
+    pattern (e.g. core/risk/position_sizing_strategies.py's own
+    PerformanceStore) rather than depending on a concrete store type
+    that doesn't exist yet."""
+
+    sample_size: int
+    win_rate: float
+
+
+class PerformanceStore(Protocol):
+    def query(
+        self,
+        strategy_id: str,
+        regime: Regime,
+        vol_regime: VolRegime,
+        signal_strength_bucket: str,
+    ) -> PerformanceHistory: ...
 
 
 @dataclass
 class ConfidenceReport:
     signal: Signal
-    confidence: float              # 0-1, calibrated estimate
-    sample_size: int               # how many historical instances this rests on
-    basis: list[str]               # e.g. ["regime=bull_trend win_rate=0.61 n=842"]
-    caveats: list[str]             # e.g. ["low sample size (n=23)"]
+    confidence: float  # 0-1, calibrated estimate
+    sample_size: int  # how many historical instances this rests on
+    basis: list[str]  # e.g. ["regime=bull_trend win_rate=0.61 n=842"]
+    caveats: list[str]  # e.g. ["low sample size (n=23)"]
 
 
 class ConfidenceEngine:
-    def __init__(self, performance_store, regime_detector, min_sample_size=30):
-        self.performance_store = performance_store   # historical signal outcomes
+    def __init__(
+        self,
+        performance_store: PerformanceStore,
+        regime_detector: RegimeDetector,
+        min_sample_size: int = 30,
+    ) -> None:
+        self.performance_store = performance_store  # historical signal outcomes
         self.regime_detector = regime_detector
         self.min_sample_size = min_sample_size
 
-    def evaluate(self, signal: Signal, feature_window: "FeatureWindow") -> ConfidenceReport:
+    def evaluate(self, signal: Signal, feature_window: FeatureWindow) -> ConfidenceReport:
         state = self.regime_detector.classify(feature_window)
 
         history = self.performance_store.query(
@@ -42,7 +72,9 @@ class ConfidenceEngine:
 
         if history.sample_size < self.min_sample_size:
             return ConfidenceReport(
-                signal=signal, confidence=0.0, sample_size=history.sample_size,
+                signal=signal,
+                confidence=0.0,
+                sample_size=history.sample_size,
                 basis=[f"insufficient history ({history.sample_size} samples)"],
                 caveats=["not enough data to trust this setup yet"],
             )

@@ -22,6 +22,7 @@ noise in the regime detector, not the market.
 
 from dataclasses import dataclass, field
 
+from core.feature_store import FeatureWindow
 from core.regime_config import RegimeDetectorConfig
 from core.strategy_base import Regime, VolRegime
 
@@ -59,7 +60,7 @@ class RegimeDetector:
         self._pending_vol: VolRegime | None = None
         self._pending_vol_count: int = 0
 
-    def classify(self, feature_window: "FeatureWindow") -> RegimeState:
+    def classify(self, feature_window: FeatureWindow) -> RegimeState:
         raw_trend, trend_reason = self._classify_trend(feature_window)
         raw_vol, vol_reason = self._classify_vol(feature_window)
 
@@ -76,12 +77,12 @@ class RegimeDetector:
 
     # --- trend axis ----------------------------------------------------
 
-    def _classify_trend(self, fw) -> tuple[Regime, str]:
+    def _classify_trend(self, fw: FeatureWindow) -> tuple[Regime, str]:
         """EMA20/EMA50 order gives direction; ADX gives strength. Order
         alone can't distinguish a real trend from EMAs drifting apart
         by noise in a choppy market — ADX filters that out."""
-        ema_fast, ema_slow = fw.get("ema_20"), fw.get("ema_50")
-        adx = fw.get("adx_14")
+        ema_fast, ema_slow = float(fw.get("ema_20")), float(fw.get("ema_50"))
+        adx = float(fw.get("adx_14"))
 
         if adx < self.config.trend_adx_threshold:
             return (
@@ -94,11 +95,11 @@ class RegimeDetector:
             return Regime.BEAR_TREND, f"ema20<ema50, adx={adx:.1f}"
         return Regime.SIDEWAYS, "ema20 == ema50"
 
-    def _trend_confidence(self, fw) -> float:
+    def _trend_confidence(self, fw: FeatureWindow) -> float:
         """Normalize ADX into 0-1: at the threshold, confidence is ~0;
         by ADX 50 (a commonly cited 'very strong trend' level),
         confidence saturates at 1.0."""
-        adx = fw.get("adx_14")
+        adx = float(fw.get("adx_14"))
         return max(0.0, min((adx - self.config.trend_adx_threshold) / 30.0, 1.0))
 
     def _apply_hysteresis_trend(self, raw: Regime) -> Regime:
@@ -116,19 +117,19 @@ class RegimeDetector:
 
     # --- volatility axis -------------------------------------------------
 
-    def _classify_vol(self, fw) -> tuple[VolRegime, str]:
+    def _classify_vol(self, fw: FeatureWindow) -> tuple[VolRegime, str]:
         """Rank current ATR against its own trailing distribution
         (already computed as atr_percentile_90) rather than using ATR's
         raw price-denominated value — see derived.py for why."""
-        pct = fw.get("atr_percentile_90")
+        pct = float(fw.get("atr_percentile_90"))
         if pct >= self.config.vol_high_percentile:
             return VolRegime.HIGH_VOL, f"atr_pct={pct:.2f} >= {self.config.vol_high_percentile}"
         if pct <= self.config.vol_low_percentile:
             return VolRegime.LOW_VOL, f"atr_pct={pct:.2f} <= {self.config.vol_low_percentile}"
         return VolRegime.NORMAL_VOL, f"atr_pct={pct:.2f} within normal band"
 
-    def _vol_confidence(self, fw) -> float:
-        pct = fw.get("atr_percentile_90")
+    def _vol_confidence(self, fw: FeatureWindow) -> float:
+        pct = float(fw.get("atr_percentile_90"))
         dist = min(
             abs(pct - self.config.vol_high_percentile),
             abs(pct - self.config.vol_low_percentile),

@@ -1,5 +1,7 @@
-from datetime import datetime, timezone
-from core.strategy_base import StrategyBase, StrategyMeta, Signal, Regime
+from datetime import UTC, datetime
+
+from core.feature_store import FeatureWindow
+from core.strategy_base import Regime, Signal, StrategyBase, StrategyMeta
 
 
 class EMACrossStrategy(StrategyBase):
@@ -11,7 +13,7 @@ class EMACrossStrategy(StrategyBase):
         name="ema_cross",
         version="1.0.0",
         author="platform",
-        created_at=datetime(2026, 7, 13, tzinfo=timezone.utc),
+        created_at=datetime(2026, 7, 13, tzinfo=UTC),
         description="EMA20/EMA50 crossover trend follower.",
         parameters={"fast_period": 20, "slow_period": 50},
         compatible_pipeline_versions=["features_v1"],
@@ -20,7 +22,7 @@ class EMACrossStrategy(StrategyBase):
     required_features = ["close", "ema_20", "ema_50", "ema_20_prev", "ema_50_prev"]
     min_lookback = 50
 
-    def generate_signal(self, feature_window) -> Signal:
+    def generate_signal(self, feature_window: FeatureWindow) -> Signal:
         fast = feature_window.get("ema_20")
         slow = feature_window.get("ema_50")
         fast_prev = feature_window.get("ema_20_prev")
@@ -33,20 +35,30 @@ class EMACrossStrategy(StrategyBase):
 
         if crossed_up:
             return Signal(
-                direction=1, entry_price=close, stop_loss=None, take_profit=None,
+                direction=1,
+                entry_price=close,
+                stop_loss=None,
+                take_profit=None,
                 strategy_id=self.meta.strategy_id,
                 signal_strength=min(gap_pct * 20, 1.0),
                 reasons=[f"ema20 crossed above ema50 (gap={gap_pct:.4f})"],
             )
         if crossed_down:
             return Signal(
-                direction=-1, entry_price=close, stop_loss=None, take_profit=None,
+                direction=-1,
+                entry_price=close,
+                stop_loss=None,
+                take_profit=None,
                 strategy_id=self.meta.strategy_id,
                 signal_strength=min(gap_pct * 20, 1.0),
                 reasons=[f"ema20 crossed below ema50 (gap={gap_pct:.4f})"],
             )
         return Signal(
-            direction=0, entry_price=close, stop_loss=None, take_profit=None,
-            strategy_id=self.meta.strategy_id, signal_strength=0.0,
+            direction=0,
+            entry_price=close,
+            stop_loss=None,
+            take_profit=None,
+            strategy_id=self.meta.strategy_id,
+            signal_strength=0.0,
             rejected_reasons=["no crossover on this bar"],
         )

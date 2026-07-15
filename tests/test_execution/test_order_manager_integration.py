@@ -47,6 +47,7 @@ def db():
         session.execute(text("DELETE FROM orders WHERE strategy_id LIKE 'test_%'"))
         session.execute(text("DELETE FROM risk_decision_log WHERE strategy_id LIKE 'test_%'"))
         session.execute(text(f"DELETE FROM paper_accounts WHERE account_id = '{ACCOUNT_ID}'"))
+        session.execute(text(f"DELETE FROM live_accounts WHERE account_id = '{ACCOUNT_ID}'"))
         session.commit()
         session.close()
 
@@ -69,7 +70,7 @@ def make_risk_decision_row(db, strategy_id="test_s1", approved_quantity=1.0) -> 
     return result.scalar_one()
 
 
-def make_manager(db, prices=None, starting_balance=10_000.0):
+def make_manager(db, prices=None, starting_balance=10_000.0, mode="paper"):
     adapter = PaperExecutionAdapter(
         execution_model=ExecutionModel(fee_bps=10.0, slippage_bps=0.0),
         latency_simulator=LatencySimulator(base_ms=0.0, jitter_ms=0.0),
@@ -79,7 +80,7 @@ def make_manager(db, prices=None, starting_balance=10_000.0):
         execution_adapter=adapter,
         event_bus=PostgresEventBus(),
         db_session=db,
-        mode="paper",
+        mode=mode,
         account_id=ACCOUNT_ID,
         starting_balance=starting_balance,
     )
@@ -226,6 +227,62 @@ def test_account_balance_updated_correctly_after_sell_fill(db):
     # notional = 50 * 1 = 50; fee = 50 * 10bps = 0.05; sell increases cash
     expected_cash = 10_000.0 + 50.0 - 0.05
     assert float(cash) == pytest.approx(expected_cash)
+
+
+def test_live_mode_fill_updates_live_accounts_not_paper_accounts(db):
+    """docs/gap_audit_report.md P0 #1: a fill for a live-mode order must
+    never touch paper_accounts.current_cash — it used to, unconditionally,
+    silently mixing real and simulated trading results in one ledger."""
+    manager = make_manager(db, prices={"BTC/USDT": 100.0}, starting_balance=10_000.0, mode="live")
+    risk_decision_id = make_risk_decision_row(db, approved_quantity=2.0)
+    decision = SizingDecision(
+        approved_quantity=2.0, proposed_quantity=2.0, risk_decision_id=risk_decision_id
+    )
+
+    order = manager.submit(
+        decision,
+        strategy_id="test_s1",
+        symbol="BTC/USDT",
+        order_type=OrderType.MARKET,
+        direction=1,
+    )
+
+    assert order.mode == "live"
+    assert order.state == OrderState.FILLED
+
+    live_cash = db.execute(
+        text("SELECT current_cash FROM live_accounts WHERE account_id = :id"), {"id": ACCOUNT_ID}
+    ).scalar_one()
+    expected_cash = 10_000.0 - 200.0 - 0.2  # same fee math as the paper buy-fill test
+    assert float(live_cash) == pytest.approx(expected_cash)
+
+    # The account was never created in paper_accounts at all — not just
+    # left at its starting balance, genuinely absent.
+    paper_row = db.execute(
+        text("SELECT 1 FROM paper_accounts WHERE account_id = :id"), {"id": ACCOUNT_ID}
+    ).scalar_one_or_none()
+    assert paper_row is None
+
+
+def test_paper_mode_fill_never_touches_live_accounts(db):
+    manager = make_manager(db, prices={"BTC/USDT": 100.0}, starting_balance=10_000.0, mode="paper")
+    risk_decision_id = make_risk_decision_row(db, approved_quantity=1.0)
+    decision = SizingDecision(
+        approved_quantity=1.0, proposed_quantity=1.0, risk_decision_id=risk_decision_id
+    )
+
+    manager.submit(
+        decision,
+        strategy_id="test_s1",
+        symbol="BTC/USDT",
+        order_type=OrderType.MARKET,
+        direction=1,
+    )
+
+    live_row = db.execute(
+        text("SELECT 1 FROM live_accounts WHERE account_id = :id"), {"id": ACCOUNT_ID}
+    ).scalar_one_or_none()
+    assert live_row is None
 
 
 def test_cancel_a_submitted_not_yet_filled_order(db):

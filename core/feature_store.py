@@ -7,8 +7,10 @@ formula. Nothing hand-stores an indicator value that isn't traceable
 back to a versioned function.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
+from datetime import datetime
+from typing import Any
 
 import pandas as pd
 
@@ -27,19 +29,20 @@ class FeatureDefinition:
     which is correct but O(n^2) over a backtest. Vectorized computation
     over the full series, once, avoids both problems.
     """
+
     name: str
     version: str
-    formula: Callable
+    formula: Callable[[pd.DataFrame], pd.Series]
     parameters: dict
-    dependencies: list[str]      # other feature names this one needs first
+    dependencies: list[str]  # other feature names this one needs first
     last_updated: str
 
 
 class FeatureRegistry:
-    def __init__(self):
+    def __init__(self) -> None:
         self._defs: dict[str, FeatureDefinition] = {}
 
-    def register(self, definition: FeatureDefinition):
+    def register(self, definition: FeatureDefinition) -> None:
         self._defs[definition.name] = definition
 
     def has(self, name: str) -> bool:
@@ -49,9 +52,10 @@ class FeatureRegistry:
         """Topological sort over dependencies, e.g. 'macd' computes only
         after 'ema_12' and 'ema_26' if it depends on them. Raises on
         circular dependencies rather than silently looping."""
-        visited, order = set(), []
+        visited: set[str] = set()
+        order: list[str] = []
 
-        def visit(name, stack):
+        def visit(name: str, stack: list[str]) -> None:
             if name in visited:
                 return
             if name in stack:
@@ -84,13 +88,13 @@ class FeatureWindow:
     once, centrally, is what prevents every individual strategy from
     having to reimplement its own lookahead-bias protection."""
 
-    def __init__(self, symbol: str, timeframe: str, as_of, values: dict):
+    def __init__(self, symbol: str, timeframe: str, as_of: datetime, values: dict[str, Any]):
         self.symbol = symbol
         self.timeframe = timeframe
         self.as_of = as_of
         self._values = values
 
-    def get(self, feature_name: str):
+    def get(self, feature_name: str) -> Any:
         if feature_name not in self._values:
             raise KeyError(
                 f"'{feature_name}' not available as of {self.as_of} — "

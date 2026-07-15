@@ -16,7 +16,7 @@ Loop shape, per bar:
 from core.feature_store import FeatureWindow
 from core.regime_config import RegimeDetectorConfig
 from core.regime_detector import RegimeDetector
-from core.strategy_base import Regime, StrategyMeta, Signal, VolRegime, StrategyBase
+from core.strategy_base import Regime, Signal, StrategyBase, StrategyMeta
 from core.strategy_registry import StrategyRegistry
 
 
@@ -24,9 +24,14 @@ class _StubTrendStrategy(StrategyBase):
     """A minimal strategy stand-in, avoiding a dependency on the real
     plugin discovery mechanism (that's covered by strategy_registry's
     own tests) — this test is about the regime -> eligibility wiring."""
+
     meta = StrategyMeta(
-        name="stub_trend", version="1.0.0", author="test",
-        created_at=None, description="", parameters={},
+        name="stub_trend",
+        version="1.0.0",
+        author="test",
+        created_at=None,
+        description="",
+        parameters={},
         compatible_pipeline_versions=["features_v1"],
         works_best_in=[Regime.BULL_TREND],
     )
@@ -35,8 +40,12 @@ class _StubTrendStrategy(StrategyBase):
 
     def generate_signal(self, feature_window) -> Signal:
         return Signal(
-            direction=1, entry_price=100, stop_loss=None, take_profit=None,
-            strategy_id=self.meta.strategy_id, signal_strength=0.8,
+            direction=1,
+            entry_price=100,
+            stop_loss=None,
+            take_profit=None,
+            strategy_id=self.meta.strategy_id,
+            signal_strength=0.8,
         )
 
     def validate(self, feature_registry):
@@ -45,8 +54,12 @@ class _StubTrendStrategy(StrategyBase):
 
 class _StubSidewaysStrategy(StrategyBase):
     meta = StrategyMeta(
-        name="stub_sideways", version="1.0.0", author="test",
-        created_at=None, description="", parameters={},
+        name="stub_sideways",
+        version="1.0.0",
+        author="test",
+        created_at=None,
+        description="",
+        parameters={},
         compatible_pipeline_versions=["features_v1"],
         works_best_in=[Regime.SIDEWAYS],
     )
@@ -55,8 +68,12 @@ class _StubSidewaysStrategy(StrategyBase):
 
     def generate_signal(self, feature_window) -> Signal:
         return Signal(
-            direction=0, entry_price=100, stop_loss=None, take_profit=None,
-            strategy_id=self.meta.strategy_id, signal_strength=0.0,
+            direction=0,
+            entry_price=100,
+            stop_loss=None,
+            take_profit=None,
+            strategy_id=self.meta.strategy_id,
+            signal_strength=0.0,
         )
 
     def validate(self, feature_registry):
@@ -65,7 +82,9 @@ class _StubSidewaysStrategy(StrategyBase):
 
 def _window(ema_20=110, ema_50=100, adx=30.0, atr_pct=0.5):
     return FeatureWindow(
-        symbol="BTCUSDT", timeframe="1h", as_of="t",
+        symbol="BTCUSDT",
+        timeframe="1h",
+        as_of="t",
         values={"ema_20": ema_20, "ema_50": ema_50, "adx_14": adx, "atr_percentile_90": atr_pct},
     )
 
@@ -98,7 +117,9 @@ def test_eligibility_switches_when_confirmed_regime_changes():
     bull_eligible = {s.meta.strategy_id for s in registry.get_candidates_for_regime(bull_state)}
 
     sideways_state = detector.classify(_window(adx=5.0))
-    sideways_eligible = {s.meta.strategy_id for s in registry.get_candidates_for_regime(sideways_state)}
+    sideways_eligible = {
+        s.meta.strategy_id for s in registry.get_candidates_for_regime(sideways_state)
+    }
 
     assert bull_eligible == {"stub_trend@1.0.0"}
     assert sideways_eligible == {"stub_sideways@1.0.0"}

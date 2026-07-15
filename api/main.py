@@ -35,8 +35,10 @@ from api.websocket.gateway import EventGateway
 from api.websocket.router import router as websocket_router
 from core.db import SessionLocal
 from core.ingestion.event_bus import PostgresEventBus
+from core.notifications.email_sender import EmailSender
 from core.notifications.notification_log import NotificationLogStore
 from core.notifications.notification_persister import NotificationPersister
+from core.notifications.preferences_store import NotificationPreferencesStore
 
 settings = load_settings()
 
@@ -62,8 +64,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # fixed subset of events (severity-mapped) to notification_log,
     # not another WebSocket broadcaster. See
     # core/notifications/notification_persister.py's module docstring.
+    # EmailSender is always constructed (safe with no SMTP_HOST set —
+    # send() only fails at call time, matching LLMClient's lazy-client
+    # shape) so email dispatch activates the moment an operator sets
+    # SMTP_HOST/notification_preferences.email_enabled, no redeploy.
     notification_persister = NotificationPersister(
-        event_bus, store_factory=lambda: NotificationLogStore(SessionLocal())
+        event_bus,
+        store_factory=lambda: NotificationLogStore(SessionLocal()),
+        preferences_store_factory=lambda: NotificationPreferencesStore(SessionLocal()),
+        email_sender=EmailSender(),
+        account_id=settings.account_id,
     )
     app.state.event_bus = event_bus
     app.state.event_gateway = gateway

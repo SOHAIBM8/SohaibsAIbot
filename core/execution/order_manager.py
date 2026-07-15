@@ -61,6 +61,24 @@ from core.execution.order import Fill, Order, OrderState, OrderType
 from core.ingestion.event_bus import EventBus
 from core.risk.risk_decision import SizingDecision
 
+# Which cash-tracking table a fill's account effect is applied to,
+# keyed by Order.mode ('paper' | 'live' — the only two values the
+# dataclass allows). Fixed, code-owned whitelist — never derived from
+# untrusted input — so this can safely be interpolated into SQL below.
+# Added to fix docs/gap_audit_report.md P0 #1: every fill used to be
+# written into paper_accounts regardless of mode, mixing simulated and
+# real trading results in one ledger.
+_ACCOUNT_TABLE_BY_MODE = {"paper": "paper_accounts", "live": "live_accounts"}
+
+
+def _account_table(mode: str) -> str:
+    try:
+        return _ACCOUNT_TABLE_BY_MODE[mode]
+    except KeyError:
+        raise ValueError(
+            f"unknown order mode={mode!r} — no account table mapping exists for it"
+        ) from None
+
 
 class OrderManager:
     def __init__(
@@ -245,9 +263,10 @@ class OrderManager:
         self.db.commit()
 
     def _ensure_account(self, starting_balance: float) -> None:
+        table = _account_table(self.mode)
         self.db.execute(
-            text("""
-                INSERT INTO paper_accounts (account_id, starting_balance, current_cash, created_at)
+            text(f"""
+                INSERT INTO {table} (account_id, starting_balance, current_cash, created_at)
                 VALUES (:account_id, :starting_balance, :starting_balance, :created_at)
                 ON CONFLICT (account_id) DO NOTHING
                 """),
@@ -262,11 +281,16 @@ class OrderManager:
     def _apply_fill_to_account(self, order: Order, fill: Fill) -> None:
         # direction: +1 buy (cash out), -1 sell (cash in) — fee always
         # reduces cash. Matches core/portfolio.py's Portfolio cash math.
+        # Routed to paper_accounts or live_accounts by order.mode, not
+        # always paper_accounts (see _ACCOUNT_TABLE_BY_MODE's docstring
+        # for why this matters — a real fill used to silently corrupt
+        # the paper ledger).
+        table = _account_table(order.mode)
         notional = fill.fill_price * fill.quantity
         cash_delta = (-notional if order.direction > 0 else notional) - fill.fee
         self.db.execute(
-            text("""
-                UPDATE paper_accounts
+            text(f"""
+                UPDATE {table}
                 SET current_cash = current_cash + :cash_delta
                 WHERE account_id = :account_id
                 """),

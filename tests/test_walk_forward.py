@@ -1,12 +1,12 @@
 import pandas as pd
 import pytest
 
-from core.walk_forward import split_windows, run_walk_forward
 from core.backtest_engine import BacktestEngine
 from core.execution_model import ExecutionModel
 from core.position_sizing import FixedFractionSizer
 from core.regime_config import RegimeDetectorConfig
 from core.regime_detector import RegimeDetector
+from core.walk_forward import run_walk_forward, split_windows
 
 
 def test_split_windows_covers_full_dataframe_without_gaps():
@@ -33,11 +33,18 @@ def test_split_windows_rejects_too_many_windows_for_data_size():
 
 
 def test_run_walk_forward_produces_one_result_per_window():
-    df = pd.DataFrame({
-        "open": [100.0] * 40, "high": [102.0] * 40, "low": [98.0] * 40, "close": [101.0] * 40,
-        "ema_20": [100.0] * 40, "ema_50": [100.0] * 40,
-        "adx_14": [10.0] * 40, "atr_percentile_90": [0.5] * 40,
-    })
+    df = pd.DataFrame(
+        {
+            "open": [100.0] * 40,
+            "high": [102.0] * 40,
+            "low": [98.0] * 40,
+            "close": [101.0] * 40,
+            "ema_20": [100.0] * 40,
+            "ema_50": [100.0] * 40,
+            "adx_14": [10.0] * 40,
+            "atr_percentile_90": [0.5] * 40,
+        }
+    )
 
     def engine_factory():
         return BacktestEngine(

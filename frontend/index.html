@@ -4,6 +4,29 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!--
+      CSP (docs/gap_audit_report.md P1): api/security_headers.py's
+      docstring said the frontend "should set an equally strict CSP
+      itself once built" — it existed, but this was never added. No
+      external CDN/font/script is loaded anywhere in frontend/src (grep
+      confirmed); every API call and the WebSocket connection
+      (frontend/src/ws/websocketStore.ts) go through Vite's dev proxy
+      to the same origin, so connect-src 'self' covers both (ws:/wss:
+      listed explicitly too — some browsers treat the WebSocket scheme
+      as distinct from 'self' even same-origin). Dev-only caveat, not
+      glossed over: Vite's dev server needs 'unsafe-eval' for its HMR
+      module transform pipeline and 'unsafe-inline' for its dev-mode
+      CSS injection — both are Vite dev-server behavior, not anything
+      this project's own code needs. A production static build (`npm
+      run build`) has no eval'd code and would not need either, but
+      this project has no production build/deploy pipeline (CLAUDE.md —
+      no cloud infra configured), so no separate prod-only CSP variant
+      exists yet.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    />
     <title>Trading Dashboard</title>
   </head>
   <body>

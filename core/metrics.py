@@ -7,7 +7,6 @@ silently is a classic way backtests mislead people.
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -21,11 +20,11 @@ class PerformanceMetrics:
     profit_factor: float
     sharpe_ratio: float
     sortino_ratio: float
-    max_drawdown: float          # negative fraction, e.g. -0.23 = 23% drawdown
+    max_drawdown: float  # negative fraction, e.g. -0.23 = 23% drawdown
     cagr: float
-    expectancy: float            # mean pnl per trade, in account currency
-    avg_r_multiple: Optional[float]
-    exposure: float              # fraction of bars with >=1 open position
+    expectancy: float  # mean pnl per trade, in account currency
+    avg_r_multiple: float | None
+    exposure: float  # fraction of bars with >=1 open position
     total_trades: int
 
 

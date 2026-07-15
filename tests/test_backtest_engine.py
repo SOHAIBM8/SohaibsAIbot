@@ -7,7 +7,7 @@ from core.position_sizing import PositionSizer
 from core.regime_config import RegimeDetectorConfig
 from core.regime_detector import RegimeDetector
 from core.risk.risk_decision import SizingDecision
-from core.strategy_base import Regime, Signal, StrategyBase, StrategyMeta, VolRegime
+from core.strategy_base import Regime, Signal, StrategyBase, StrategyMeta
 
 
 class FixedQuantitySizer(PositionSizer):

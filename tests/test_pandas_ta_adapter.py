@@ -45,9 +45,7 @@ def test_default_registry_computes_all_registered_features(sample_ohlcv):
     every feature strategies currently declare as required."""
     registry = build_default_registry()
 
-    result = registry.compute(
-        sample_ohlcv, ["ema_20", "ema_50", "rsi_14", "atr_14", "macd_line"]
-    )
+    result = registry.compute(sample_ohlcv, ["ema_20", "ema_50", "rsi_14", "atr_14", "macd_line"])
 
     for col in ["ema_20", "ema_50", "rsi_14", "atr_14", "macd_line"]:
         assert col in result.columns

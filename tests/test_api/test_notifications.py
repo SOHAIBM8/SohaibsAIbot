@@ -3,7 +3,7 @@ Notifications API integration tests against real local Postgres. Seeds
 via the real NotificationLogStore write path.
 """
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import text
@@ -25,20 +25,28 @@ def _logged_in(client):
 
 @pytest.fixture
 def seeded_notifications(db):
+    # Real "now"-relative timestamps, not fixed past dates: the API
+    # endpoint under test orders by occurred_at DESC LIMIT 50, and a
+    # shared local dev Postgres accumulates far more than 50
+    # notification_log rows across repeated test runs — a stale
+    # hardcoded date silently falls outside that window once enough
+    # newer rows exist. Relative ordering (info after critical) is
+    # preserved via the +1s offset.
+    now = datetime.now(UTC)
     store = NotificationLogStore(db)
     store.record(
         event_type="KillSwitchEngaged",
         severity="critical",
         message=f"{_MARKER} critical",
         payload={"reason": "test"},
-        occurred_at=datetime(2024, 1, 1, tzinfo=UTC),
+        occurred_at=now,
     )
     store.record(
         event_type="CircuitBreakerCleared",
         severity="info",
         message=f"{_MARKER} info",
         payload={},
-        occurred_at=datetime(2024, 1, 2, tzinfo=UTC),
+        occurred_at=now + timedelta(seconds=1),
     )
     yield
     db.execute(text("DELETE FROM notification_log WHERE message LIKE :m"), {"m": f"%{_MARKER}%"})

@@ -1,17 +1,19 @@
 import importlib
 import inspect
 import pkgutil
+
+from core.feature_store import FeatureRegistry
 from core.regime_detector import RegimeState
 from core.strategy_base import StrategyBase
 
 
 class StrategyRegistry:
-    def __init__(self, feature_registry: "FeatureRegistry"):
+    def __init__(self, feature_registry: FeatureRegistry):
         self.feature_registry = feature_registry
         self._strategies: dict[str, StrategyBase] = {}
         self._rejected: dict[str, list[str]] = {}
 
-    def discover(self, package="strategies"):
+    def discover(self, package: str = "strategies") -> None:
         """Import every module under strategies/, find StrategyBase
         subclasses, validate each against the feature registry, and
         register only the ones that pass. A broken strategy fails loud

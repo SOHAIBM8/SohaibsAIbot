@@ -2,12 +2,41 @@
 DataQualityService (spec 4.11). Distinct from GapDetectionService:
 that asks "is anything missing", this asks "is what's stored actually
 correct" — duplicates, OHLC violations, timestamp drift, volume
-anomalies, cross-timeframe reconciliation, and (given an adapter)
-drift against the exchange itself. Each check is independent and
-reported separately so a single bad check never masks the others.
+anomalies, missing-candle cross-reference, cross-timeframe
+reconciliation, and (given an adapter) drift against the exchange
+itself. Each check is independent and reported separately so a single
+bad check never masks the others.
+
+Missing-candles check (docs/gap_audit_report.md P1): spec 4.11 item 1
+asks this service to "cross-reference with GapDetectionService's
+findings" rather than re-run gap detection itself — this check reads
+the already-persisted `ingestion_gap` table (status='pending', the
+only non-terminal state — 'confirmed_absent' is a deliberate
+give-up per GapRepairService and must not be re-flagged here either)
+scoped to this window, rather than duplicating GapDetectionService's
+generate_series logic a second time.
+
+Timeframe-consistency check (docs/gap_audit_report.md P1): spec 4.11
+item 6's own example is literal — "summing 1m candles for an hour
+should reconcile with the stored 1h candle" — so this reconciles every
+non-1m timeframe directly against 1m candles (the base timeframe),
+not against the next-adjacent-smaller timeframe (e.g. 15m for 1h):
+1m is the one timeframe this platform ingests unconditionally for
+every tracked instrument, whereas an intermediate timeframe like 15m
+may not be tracked at all for a given symbol, which would silently
+skip the check rather than actually reconcile anything. For each
+checked candle, this pulls the exact set of 1m candles inside its
+window; if that set isn't *complete* (some 1m candles are simply
+missing), the check is skipped for that candle — that's a
+completeness gap already surfaced by the missing-candles check /
+GapDetectionService, not a consistency issue. Otherwise the two are
+compared with a small tolerance (float rounding from exchange APIs,
+not a config knob — rule 8, no premature configurability for a
+tolerance nothing has ever needed to tune).
 """
 
 import json
+import math
 import statistics
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -21,7 +50,7 @@ from core.ingestion.config import IngestionConfig
 from core.ingestion.event_bus import EventBus
 from core.ingestion.events import DataQualityIssueFound
 from core.ingestion.exchange_adapter import ExchangeAdapter
-from core.ingestion.timeframe import is_aligned
+from core.ingestion.timeframe import is_aligned, timeframe_to_timedelta
 from core.ingestion.types import RawCandle
 from core.ingestion.watermark import upsert_watermark
 
@@ -56,6 +85,17 @@ class DataQualityReport:
             f"{self.candles_checked} candles checked, {len(self.issues)} issues found ({counts})."
         )
 
+    def passed(self, threshold: str = "warning") -> bool:
+        """True if no issue's severity is at or above `threshold`.
+        Added to fix docs/gap_audit_report.md P0 #2: run() itself only
+        ever used `_SEVERITY_ORDER` internally to decide whether to
+        publish a `DataQualityIssueFound` event — it never returned a
+        pass/fail answer, so nothing outside this module could ask
+        'is this data actually usable.' Reuses the exact same ordering
+        `run()` already applies for alerting, not a second judgment."""
+        threshold_rank = _SEVERITY_ORDER[threshold]
+        return all(_SEVERITY_ORDER[issue.severity] < threshold_rank for issue in self.issues)
+
 
 class DataQualityService:
     def __init__(
@@ -87,6 +127,8 @@ class DataQualityService:
         self._check_ohlc_validity(rows, timeframe, now, report)
         self._check_timestamp_alignment(rows, timeframe, report)
         self._check_volume_anomalies(rows, report)
+        self._check_missing_candles(exchange, symbol, timeframe, window_start, now, report)
+        self._check_timeframe_consistency(exchange, symbol, timeframe, rows, report)
         if self.adapter is not None:
             self._check_cross_exchange(exchange, symbol, timeframe, rows, now, report)
 
@@ -209,6 +251,124 @@ class DataQualityService:
                     )
                 )
 
+    def _check_missing_candles(
+        self,
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        start: datetime,
+        end: datetime,
+        report: DataQualityReport,
+    ) -> None:
+        report.checks_run.append("missing_candles")
+        gaps = (
+            self.db.execute(
+                text("""
+                SELECT gap_start, gap_end
+                FROM ingestion_gap
+                WHERE exchange = :exchange AND symbol = :symbol AND timeframe = :timeframe
+                  AND status = 'pending'
+                  AND gap_start <= :end AND gap_end >= :start
+                ORDER BY gap_start
+                """),
+                {
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "start": start,
+                    "end": end,
+                },
+            )
+            .mappings()
+            .all()
+        )
+        for gap in gaps:
+            report.issues.append(
+                Issue(
+                    check="missing_candles",
+                    severity="warning",
+                    detail=(
+                        f"unresolved gap from {gap['gap_start'].isoformat()} "
+                        f"to {gap['gap_end'].isoformat()} (per GapDetectionService)"
+                    ),
+                )
+            )
+
+    def _check_timeframe_consistency(
+        self,
+        exchange: str,
+        symbol: str,
+        timeframe: str,
+        rows: list[dict],
+        report: DataQualityReport,
+    ) -> None:
+        report.checks_run.append("timeframe_consistency")
+        if timeframe == _BASE_TIMEFRAME or not rows:
+            return
+
+        interval = timeframe_to_timedelta(timeframe)
+        base_interval = timeframe_to_timedelta(_BASE_TIMEFRAME)
+        expected_sub_candles = int(interval / base_interval)
+
+        for row in rows:
+            window_start = row["open_time"]
+            window_end = window_start + interval
+            sub_rows = (
+                self.db.execute(
+                    text("""
+                    SELECT open_time, open, high, low, close, volume
+                    FROM raw_ohlcv
+                    WHERE exchange = :exchange AND symbol = :symbol AND timeframe = :base_timeframe
+                      AND open_time >= :window_start AND open_time < :window_end
+                    ORDER BY open_time
+                    """),
+                    {
+                        "exchange": exchange,
+                        "symbol": symbol,
+                        "base_timeframe": _BASE_TIMEFRAME,
+                        "window_start": window_start,
+                        "window_end": window_end,
+                    },
+                )
+                .mappings()
+                .all()
+            )
+            if len(sub_rows) != expected_sub_candles:
+                # Incomplete 1m coverage for this window is a
+                # completeness gap (already surfaced elsewhere), not a
+                # consistency mismatch — skip rather than compare partial data.
+                continue
+
+            agg_open = float(sub_rows[0]["open"])
+            agg_close = float(sub_rows[-1]["close"])
+            agg_high = max(float(r["high"]) for r in sub_rows)
+            agg_low = min(float(r["low"]) for r in sub_rows)
+            agg_volume = sum(float(r["volume"]) for r in sub_rows)
+
+            mismatches = [
+                name
+                for name, stored, aggregated in (
+                    ("open", float(row["open"]), agg_open),
+                    ("high", float(row["high"]), agg_high),
+                    ("low", float(row["low"]), agg_low),
+                    ("close", float(row["close"]), agg_close),
+                    ("volume", float(row["volume"]), agg_volume),
+                )
+                if not math.isclose(stored, aggregated, rel_tol=1e-6, abs_tol=1e-8)
+            ]
+            if mismatches:
+                report.issues.append(
+                    Issue(
+                        check="timeframe_consistency",
+                        severity="warning",
+                        detail=(
+                            f"open_time={row['open_time'].isoformat()} {timeframe} candle "
+                            f"disagrees with its {expected_sub_candles} {_BASE_TIMEFRAME} "
+                            f"sub-candles on: {', '.join(mismatches)}"
+                        ),
+                    )
+                )
+
     def _check_cross_exchange(
         self,
         exchange: str,
@@ -313,6 +473,9 @@ class DataQualityService:
             },
         )
         self.db.commit()
+
+
+_BASE_TIMEFRAME = "1m"  # the one timeframe every tracked instrument ingests unconditionally
 
 
 def _row_to_candle(row: dict) -> RawCandle:

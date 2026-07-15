@@ -249,18 +249,25 @@ so Claude Code can continue that work without needing that conversation.
   from a trading event.
 
 ## Build order (don't skip ahead)
-Foundations → backtesting engine → execution layer → risk engine → SaaS
-multi-tenancy → AI signal research. AI is deliberately last — infra and
-risk discipline come first. Risk engine is built. Execution layer
-Stage 1 (paper trading), Stage 2 (real Binance TESTNET order
-placement), and Stage 3 (live trading security: encrypted credentials,
-arming, audit) are all built. **Built and tested is not the same as
-"cleared for real money"** — see the explicit soak-period caveat in
-the architectural-decisions section above; that call is the user's to
-make separately. The AI Analysis & Signal Explanation Engine (all 9
-build-order steps) is built, strictly downstream/read-only of
-everything above it — see the dedicated write-up below. SaaS
-multi-tenancy is next, not yet started.
+Foundations → backtesting engine → execution layer → risk engine → AI
+signal research → dashboard UI → SaaS multi-tenancy. AI is deliberately
+before the dashboard — the dashboard is a thin display/control layer
+over everything below it, so it comes last among the pre-SaaS phases.
+Risk engine is built. Execution layer Stage 1 (paper trading), Stage 2
+(real Binance TESTNET order placement), and Stage 3 (live trading
+security: encrypted credentials, arming, audit) are all built. **Built
+and tested is not the same as "cleared for real money"** — see the
+explicit soak-period caveat in the architectural-decisions section
+above; that call is the user's to make separately. The AI Analysis &
+Signal Explanation Engine (all 9 build-order steps) is built, strictly
+downstream/read-only of everything above it — see the dedicated
+write-up below. The Dashboard UI (all 28 spec sections/build steps) is
+built — see its dedicated write-up below — but **does not include a
+live execution loop or a Strategy Management page**; see "What's NOT
+built yet" for exactly what that means and doesn't mean. A gap audit
+and remediation pass (docs/gap_audit_report.md) closed several silent
+gaps found across every stage above — see "P0/P1 remediation" below
+for the full list. SaaS multi-tenancy is next, not yet started.
 
 ## What's built so far
 - `core/strategy_base.py` — `Signal`, `StrategyMeta`, `StrategyBase`, `Regime`, `VolRegime`
@@ -511,15 +518,17 @@ multi-tenancy is next, not yet started.
     (`LOT_SIZE`/`PRICE_FILTER`/`MIN_NOTIONAL` only), discovered when a
     test limit order priced 50% below market was correctly rejected by
     the exchange for exactly this reason
-  - **Known gap, not fixed here (forbidden by the spec's own
-    integration point #1 — `OrderManager` must not change for Stage 2
-    to work):** `OrderManager._apply_fill_to_account()` unconditionally
-    writes to `paper_accounts.current_cash` regardless of `order.mode`.
-    This was unreachable in Stage 1 (`LiveExecutionAdapter` always
-    raised `NotImplementedError`) and is now reachable via a real live
-    fill for the first time. Fixing it needs either a mode branch in
-    `OrderManager` (forbidden) or a real live-account-balance model —
-    realistically Stage 3 territory.
+  - **Known gap at the time, since fixed (P0 #1, see "P0/P1
+    remediation" below):** `OrderManager._apply_fill_to_account()` used
+    to unconditionally write every fill's cash delta to
+    `paper_accounts.current_cash` regardless of `order.mode` — harmless
+    while `LiveExecutionAdapter` always raised `NotImplementedError`
+    (Stage 1), silently live-reachable once Stage 2 shipped. A
+    `live_accounts` table plus a fixed-whitelist `_account_table(mode)`
+    lookup now route the write correctly by mode; `orders.account_id`'s
+    FK to `paper_accounts` was dropped in favor of application-level
+    validation, since the column can mean either table depending on
+    mode.
 - **Live Execution Stage 3 — live trading security** (`core/security/`,
   `docs/execution_engine_stage3_spec.md`). **Complete and tested is
   explicitly NOT the same as "cleared for real money"** — see the
@@ -684,7 +693,171 @@ multi-tenancy is next, not yet started.
     trip (not the full Anthropic multi-turn `tool_result` protocol),
     since the spec's `LLMClient.generate()` signature carries no
     conversation history
-- Full test suite in `tests/` — 566 tests collected: 563 passing +
+- **Dashboard UI** (`api/`, `frontend/`, `docs/dashboard_ui_spec.md`) —
+  a FastAPI backend layered thinly over `core/`, and a React/Vite
+  frontend, both built to the spec's explicit constraint: the
+  dashboard **never** computes signals, sizes positions, or makes risk
+  decisions itself — it only displays what `core/` already decided and
+  relays explicitly-confirmed operator actions through the exact same
+  backend checks (Risk Engine, `KillSwitch`, `ArmingService`) already
+  in place. Single-operator session auth for V1, schema left ready for
+  multi-tenant later (spec's locked-in decision #1):
+  - `api/auth/` — `router.py` (login/logout/me), `session_store.py`
+    (Postgres-backed sessions; login checks `hmac.compare_digest` +
+    `bcrypt.checkpw` against `DASHBOARD_OPERATOR_USERNAME`/
+    `DASHBOARD_OPERATOR_PASSWORD_HASH` env vars, then a random 32-byte
+    token is minted — only its SHA-256 hash is ever stored server-side,
+    the raw token goes out as an httpOnly `secure`/`samesite=lax`
+    cookie), `csrf.py` (double-submit cookie, validated on every
+    mutating endpoint), `dependencies.py`, `rate_limiter.py` (login
+    attempts)
+  - `api/routes/` — `health.py` (unauthenticated readiness),
+    `dashboard.py` (landing aggregate: equity curve, recent risk
+    decisions, latest daily summary), `market.py`, `portfolio.py`,
+    `orders.py` (list/detail + cancel-order control action),
+    `positions.py` (scoped down — no persistent `positions` table
+    exists yet, see Stage 1's known gaps above), `risk.py` (risk
+    monitoring + kill-switch engage/disengage + arm/disarm control
+    actions), `settings.py` (credential entry, notification
+    preferences), `notifications.py` (read-only feed from
+    `notification_log`), `ai_assistant.py` (chat + explanations,
+    wraps the existing `ChatQueryService`/`ExplanationCache` — no new
+    AI logic, this is purely a display layer over Step above)
+  - `api/websocket/` — `gateway.py`'s `EventGateway` is a second,
+    independent subscriber on the *same* `EventBus`
+    `NotificationPersister` already subscribes to (from
+    `core/ingestion/event_bus.py`) — one persists to
+    `notification_log`, the other broadcasts live to connected
+    browsers via `ConnectionManager`. The `EventBus` callback fires
+    synchronously on its own LISTEN/NOTIFY thread; `EventGateway`
+    captures the asyncio event loop at `start()` and bridges via
+    `asyncio.run_coroutine_threadsafe()`. `account_resolver.py`'s
+    `OrderAccountResolver` resolves which account an event belongs to;
+    an event that can't be attributed to an account is dropped, never
+    broadcast to everyone
+  - `core/notifications/` — `notification_log.py` (read/write access to
+    `notification_log`), `preferences_store.py` (per-account channel
+    toggles; "no row yet" returns sensible defaults, never an error),
+    `severity.py` (single `event_type -> severity` source of truth so
+    the frontend never invents its own taxonomy), plus
+    `notification_persister.py`/`email_sender.py` (see P0 #3 below)
+  - `api/security_headers.py` — strict CSP + `X-Content-Type-Options`/
+    `X-Frame-Options`/`Referrer-Policy` middleware on every API
+    response, defense in depth even though the API is pure JSON
+  - `frontend/src/pages/` — `DashboardPage` (landing overview),
+    `LiveMarketPage` (candlestick chart via `lightweight-charts`),
+    `PortfolioPage`, `OrdersPage`/`OrderDetailPage`, `PositionsPage`,
+    `RiskPage` (arm/disarm, kill switch — spec section 25's "these get
+    dedicated E2E coverage" pages), `ExperimentsPage`,
+    `AiAssistantPage`, `NotificationsPage`, `SettingsPage`
+    (credentials, masked-only display per spec — plaintext never
+    round-trips back to the browser)
+  - `frontend/src/ws/websocketStore.ts` — a Zustand store connecting to
+    `ws(s)://<same-origin>/api/ws` (proxied through Vite in dev, see
+    `frontend/vite.config.ts`), exponential-backoff-with-jitter
+    reconnect mirroring the backend's own exchange-WebSocket reconnect
+    pattern; exposes connection `status` and a rolling 100-event buffer
+  - `frontend/e2e/` (Playwright, against the real dev stack — no mocked
+    backend) — `kill-switch.spec.ts`, `arming.spec.ts`,
+    `credential-entry.spec.ts`; per spec section 25, these three
+    control-surface flows get dedicated E2E coverage beyond unit tests
+    given what they control
+  - Known, deliberate gaps: **no live execution loop exists anywhere
+    in the dashboard or `core/`** — arming a strategy
+    (`POST /api/risk/arming/arm`) is a pure DB upsert with zero
+    execution side effect, and `OrderManager.submit()`/
+    `is_trading_permitted()` have zero callers outside `tests/`; see
+    "What's NOT built yet" for what this actually means. No Strategy
+    Management page exists (spec-deferred, not silently dropped) — see
+    the same section for the exact consequence this has today.
+
+## P0/P1 remediation (docs/gap_audit_report.md)
+A full audit cross-checked every spec's "Open Decisions"/"Non-goals"
+against the actual codebase and found silent gaps beyond what CLAUDE.md
+already documented as deliberate. The remediation plan prioritized
+three P0 items (real correctness/security bugs) and four P1 items
+(completeness/observability gaps); all seven are done, tested, and
+described in-place in the relevant sections above/below rather than
+only here — this section is a pointer, not a duplicate write-up:
+- **P0 #1 — paper/live ledger mixing.** `OrderManager` unconditionally
+  wrote every fill's cash delta to `paper_accounts`, even for
+  `mode="live"` orders — unreachable in Stage 1 (`LiveExecutionAdapter`
+  always raised `NotImplementedError`) but silently live-reachable once
+  Stage 2 shipped. Fixed with a new `live_accounts` table and a fixed
+  whitelist `_account_table(mode)` lookup in
+  `core/execution/order_manager.py` — `orders.account_id`'s FK to
+  `paper_accounts` was dropped (it structurally couldn't reference
+  either table depending on mode) in favor of application-level
+  validation. Tests prove genuine isolation (a live fill never touches
+  `paper_accounts` and vice versa), not just "unchanged."
+- **P0 #2 — data quality never gated risk decisions.**
+  `DataQualityService` computed a report but exposed no pass/fail
+  answer, and `BacktestEngine` hardcoded `data_quality_ok=True` into
+  every `RiskContext` regardless of what a real data quality run found.
+  Fixed: `DataQualityReport.passed(threshold="warning")` (reuses the
+  existing severity ordering), and `BacktestEngine.__init__` now
+  accepts real `data_quality_ok`/`data_quality_reason` values instead
+  of hardcoding them — `RejectionReason.DATA_QUALITY_FAILED` is
+  reachable end-to-end now, proven by test.
+- **P0 #3 — notification email toggle was inert.**
+  `notification_preferences.email_enabled`/`email_address` were pure
+  storage — nothing ever read them to send anything.
+  `core/notifications/email_sender.py`'s `EmailSender` (stdlib
+  `smtplib`, STARTTLS-only, credentials from env vars, lazy real-client
+  construction matching `LLMClient`'s pattern) is now wired into
+  `NotificationPersister._maybe_send_email()`, scoped to exactly the
+  three event categories with an existing toggle
+  (`notify_on_kill_switch`/`notify_on_credential_validation_failed`/
+  `notify_on_drawdown_breach`) — an email failure is logged, never lets
+  the in-app feed write become a casualty.
+- **P1 — `GapDetected` was spec'd but structurally unpublishable.**
+  `GapDetectionService`'s constructor never accepted an `event_bus` at
+  all, unlike its sibling ingestion services. Fixed — now only fires
+  for a gap this specific scan *newly* recorded (via the `INSERT ...
+  ON CONFLICT DO NOTHING` row's real `rowcount`), not every time an
+  already-pending gap is re-detected on a later scan.
+- **P1 — `DataQualityService`'s docstring overclaimed, and 2 of the
+  spec's 7 checks were simply missing.** Implemented
+  `_check_missing_candles` (cross-references `ingestion_gap`'s
+  `status='pending'` rows rather than re-running gap detection) and
+  `_check_timeframe_consistency` (reconciles every non-1m timeframe
+  directly against 1m candles — the spec's own literal example — not
+  against the next-adjacent-smaller timeframe, since 1m is the one
+  timeframe every tracked instrument ingests unconditionally; a
+  window's lower-timeframe coverage must be *complete* or the check
+  skips it rather than comparing partial data).
+- **P1 — the frontend had no CSP.** `api/security_headers.py`'s own
+  docstring said the frontend "should set an equally strict CSP itself
+  once built" — it existed and this was never done.
+  `frontend/index.html` now carries a CSP `<meta>` tag (`connect-src
+  'self'` covers both fetch and the same-origin WebSocket proxy); its
+  comment documents the one real caveat honestly: Vite's *dev server*
+  needs `'unsafe-eval'`/`'unsafe-inline'` for HMR, which a production
+  static build wouldn't need, but this project has no production build
+  pipeline (see the explicit scope decision below), so no separate
+  prod-only variant exists yet.
+- **P1 — no CI.** `.github/workflows/ci.yml` now runs, against a fresh
+  ephemeral Postgres service container per job (never a shared/stateful
+  DB): `black --check`/`ruff check`/`mypy`/`pytest -v` (backend job),
+  `oxlint`/`tsc -b && vite build` (frontend-build job), and the full
+  Playwright E2E suite against a real `uvicorn` + `vite dev` stack
+  (e2e job, `--workers=1` — the control-surface specs share global
+  backend state). The `testnet`-marked Binance suite is skipped here
+  exactly like it is locally, since it needs real credentials CI has no
+  business holding.
+- **Explicitly declined, not part of this remediation pass**: standing
+  up production deployment infrastructure (Docker production
+  configs/reverse proxy/HTTPS/Prometheus/Grafana/alerting) was
+  requested in the same authorization that scoped this remediation
+  work, but conflicts with this project's repeatedly-confirmed "local
+  dev only, no cloud infrastructure configured" decision (see Stage 3's
+  `KMSClient`/`MainnetGate` bullets above) — building production
+  infrastructure around `LocalDevKMSClient` (explicitly a testnet-only,
+  never-production stand-in) and then calling the result "production
+  ready" would be actively misleading given the security foundation
+  underneath it is deliberately non-production. Flagged here rather
+  than silently built or silently dropped.
+- Full test suite in `tests/` — 752 tests collected: 749 passing +
   3 real-testnet-only as of last run, all against real local Postgres
   and/or a real local WebSocket server, no mocks; LLM calls faked in
   the standard suite; Binance calls faked in the standard suite except
@@ -698,8 +871,38 @@ multi-tenancy is next, not yet started.
   API-deprecation issue (410 Gone on the old listenKey endpoint) the
   first run surfaced and how it was fixed, and for the credential
   fresh-fetch-per-call design decision the second wiring required.
+  `black .`/`ruff check .`/`mypy core/ strategies/ api/` are all clean
+  across the entire repository as of this remediation pass — several
+  pre-existing violations from earlier build phases (missing type
+  annotations, unresolved forward-reference type hints, unformatted
+  files) were fixed as part of the same authorization that requested
+  "resolve linting, formatting, typing... issues," verified
+  mechanically safe (type annotations and import fixes only, zero
+  behavior change) by re-running the full suite after each fix.
 
 ## What's NOT built yet (next up)
+- **No live execution loop exists anywhere in the codebase — this is
+  the single most important gap to understand before assuming anything
+  here is close to trading real money.** Every piece downstream of a
+  signal (Risk Engine, `OrderManager`, `BinanceExecutionAdapter`,
+  `is_trading_permitted()`) is built and tested in isolation, but
+  nothing anywhere actually runs the loop of: discover strategies →
+  classify regime → generate signals → size via Risk Engine → submit
+  via `OrderManager`. Confirmed by direct inspection during the P0/P1
+  remediation pass: `OrderManager.submit()` and
+  `is_trading_permitted()` both have zero callers outside `tests/`.
+  Arming a strategy through the dashboard (`POST
+  /api/risk/arming/arm`) has **zero execution effect** — it is a pure
+  `arming_state` DB upsert; nothing reads that table to decide whether
+  to actually trade. The missing Strategy Management page (below) is a
+  smaller, secondary gap — even with that page built, there would
+  still be nothing for it to arm into actual execution.
+- No Strategy Management page/API exists in the dashboard (spec never
+  scheduled it — deferred, not silently dropped) — today the only way
+  to register a strategy for testnet execution is direct
+  `StrategyRegistry`/config-level wiring, not anything an operator can
+  do through the UI. Moot in practice until the live execution loop
+  above exists to run a registered strategy at all.
 - Execution layer Stage 3's own open decision #1: a real (non-stub)
   `KMSClient` for a real cloud provider (AWS KMS / Vault / etc.) —
   deferred since no cloud infrastructure is configured in this project
@@ -708,20 +911,25 @@ multi-tenancy is next, not yet started.
   gate) is built and tested in isolation but NOT yet called from
   `OrderManager`/`RiskEngine`'s actual live order-submission path —
   the gate exists and works; nothing yet consults it before every live
-  order. Real remaining work, not assumed done
+  order. Real remaining work, not assumed done (and moot until the live
+  execution loop above exists to call it from)
 - `SymbolFilterCache` doesn't model Binance's `PERCENT_PRICE_BY_SIDE`
   filter (price-deviation-from-market) — only
   `LOT_SIZE`/`PRICE_FILTER`/`MIN_NOTIONAL` per the spec's decision #5;
   a limit order priced far enough from market will be correctly
   rejected by the exchange (not a crash) but not caught locally first
-- The `paper_accounts.current_cash`-for-live-orders gap flagged above —
-  needs a real live-account-balance model
 - Whatever writes `account_snapshots` — nothing does yet (Stage 1
   gap), which is why `DailySummaryContext` can raise `LookupError` for
   dates with no snapshot coverage
 - The real-API (non-pytest) integration tests for `LLMClient` mentioned
   in `docs/ai_assistant_spec.md` section 5 — not run as part of this
   build, since they cost real money and need a real `ANTHROPIC_API_KEY`
+- **Production deployment infrastructure** (Docker production
+  configs, reverse proxy, HTTPS, Prometheus/Grafana, alerting) —
+  explicitly requested during the P0/P1 remediation authorization and
+  explicitly declined; see the "Explicitly declined" bullet in the
+  P0/P1 remediation section above for the full reasoning. This project
+  remains local-dev-only by standing decision.
 - **A deliberate testnet soak period under the full Stage 3 security
   path, before any real `mainnet=True` credential is used** — a human
   decision, made separately by the user, not a code deliverable
@@ -732,11 +940,26 @@ multi-tenancy is next, not yet started.
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 docker compose up -d        # starts local Postgres
+psql <DATABASE_URL> -f schema.sql   # apply schema (needed once per fresh DB)
 pytest -v                   # run all tests
 ruff check .                # lint
 black .                     # format
-mypy core/ strategies/      # type check
+mypy core/ strategies/ api/ # type check
 ```
+
+Frontend (from `frontend/`):
+```bash
+npm install
+npm run dev                 # Vite dev server on :5173, proxies /api to :8000
+npm run lint                # oxlint
+npm run build                # tsc -b && vite build
+npm run test:e2e             # Playwright — needs backend + Postgres + Vite dev server already running, see frontend/e2e/README.md
+```
+
+`.github/workflows/ci.yml` runs all of the above (backend suite +
+quality gates, frontend build, full E2E suite) on every push/PR against
+a fresh ephemeral Postgres container — the reproducible source of truth
+for "does this actually pass," not this file's prose.
 
 ## Working style
 The user (project owner) has zero prior coding experience and is learning

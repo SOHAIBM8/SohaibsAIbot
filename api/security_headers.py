@@ -1,11 +1,13 @@
 """
 Security headers middleware (spec section 24). A strict CSP even
-though this service returns JSON, not HTML — defense in depth, and
-the frontend's own `index.html` (served separately by Vite/its build
-output, not by this API) should set an equally strict CSP itself once
-built. `X-Content-Type-Options`/`X-Frame-Options` cost nothing and
-close off a class of browser-side misinterpretation attacks even on a
-pure JSON API.
+though this service returns JSON, not HTML — defense in depth.
+`frontend/index.html` (served separately by Vite/its build output,
+not by this API) carries its own CSP `<meta>` tag now
+(docs/gap_audit_report.md P1) — see that file's comment for the
+frontend-specific policy and its documented dev-server caveat.
+`X-Content-Type-Options`/`X-Frame-Options` cost nothing and close off
+a class of browser-side misinterpretation attacks even on a pure JSON
+API.
 """
 
 from collections.abc import Awaitable, Callable

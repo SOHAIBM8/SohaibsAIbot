@@ -43,7 +43,9 @@ def compute_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return result[f"ADX_{period}"]
 
 
-def compute_macd_line(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.Series:
+def compute_macd_line(
+    df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9
+) -> pd.Series:
     """MACD line only (fast EMA - slow EMA). Signal/histogram are
     separate features so strategies can depend on just the piece they need."""
     result = ta.macd(df["close"], fast=fast, slow=slow, signal=signal)

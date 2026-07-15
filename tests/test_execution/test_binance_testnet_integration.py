@@ -108,7 +108,12 @@ def db():
         session.execute(
             text("DELETE FROM risk_decision_log WHERE strategy_id = :s"), {"s": STRATEGY_ID}
         )
+        # This suite submits mode="live" orders — real fills route to
+        # live_accounts now, not paper_accounts (docs/gap_audit_report.md
+        # P0 #1). Clean up both; whichever one this run actually wrote to
+        # is the only one with a row to delete either way.
         session.execute(text("DELETE FROM paper_accounts WHERE account_id = :a"), {"a": ACCOUNT_ID})
+        session.execute(text("DELETE FROM live_accounts WHERE account_id = :a"), {"a": ACCOUNT_ID})
         session.commit()
         session.close()
 

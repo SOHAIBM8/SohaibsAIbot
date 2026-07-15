@@ -7,9 +7,18 @@ from core.portfolio import Trade
 
 def make_trade(pnl, entry_time, exit_time, r_multiple=None):
     return Trade(
-        strategy_id="s1", direction=1, entry_time=entry_time, exit_time=exit_time,
-        entry_price=100.0, exit_price=100.0 + pnl, quantity=1.0, fees_paid=0.0,
-        pnl=pnl, pnl_pct=pnl / 100.0, r_multiple=r_multiple, exit_reason="manual",
+        strategy_id="s1",
+        direction=1,
+        entry_time=entry_time,
+        exit_time=exit_time,
+        entry_price=100.0,
+        exit_price=100.0 + pnl,
+        quantity=1.0,
+        fees_paid=0.0,
+        pnl=pnl,
+        pnl_pct=pnl / 100.0,
+        r_multiple=r_multiple,
+        exit_reason="manual",
         regime_at_entry="bull_trend",
     )
 

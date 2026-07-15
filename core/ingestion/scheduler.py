@@ -123,7 +123,9 @@ class Scheduler:
                 summary.incrementals_run.append(key)
 
             if self._due(watermark.last_gap_scan_at, NIGHTLY_INTERVAL.total_seconds(), now):
-                GapDetectionService(self.db).run(exchange, symbol, timeframe, now)
+                GapDetectionService(self.db, event_bus=self.event_bus).run(
+                    exchange, symbol, timeframe, now
+                )
                 summary.gap_scans_run.append(key)
 
             if self._due(

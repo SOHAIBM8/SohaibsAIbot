@@ -12,14 +12,28 @@ detection isn't in that enum (spec section 3.4). Rather than widen a
 constraint the spec didn't ask for, this service records its own audit
 trail via ingestion_watermark.last_gap_scan_at, which is enough to
 answer "did a scan run, and when" for this component.
+
+`event_bus`/`GapDetected` publishing (added — docs/gap_audit_report.md
+P1): spec 4.9 lists GapDetected among this component's events, but the
+constructor never accepted an event_bus at all — structurally
+incapable of publishing it, unlike GapRepaired/BackfillCompleted/
+DataQualityIssueFound, which all do. Only fires for a gap this
+specific call to run() newly recorded (`_record_gap` returns whether
+its INSERT actually added a row, not a no-op via ON CONFLICT DO
+NOTHING) — an already-pending gap re-detected on a later scan doesn't
+re-fire the event every cycle, mirroring GapRepaired's "only publish
+on a real state transition" discipline.
 """
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import cast
 
-from sqlalchemy import text
+from sqlalchemy import CursorResult, text
 from sqlalchemy.orm import Session
 
+from core.ingestion.event_bus import EventBus
+from core.ingestion.events import GapDetected
 from core.ingestion.timeframe import timeframe_to_timedelta
 from core.ingestion.watermark import get_watermark, upsert_watermark
 
@@ -37,8 +51,9 @@ class GapDetectionResult:
 
 
 class GapDetectionService:
-    def __init__(self, db: Session):
+    def __init__(self, db: Session, event_bus: EventBus | None = None):
         self.db = db
+        self.event_bus = event_bus
 
     def run(
         self, exchange: str, symbol: str, timeframe: str, now: datetime | None = None
@@ -82,13 +97,26 @@ class GapDetectionService:
         gaps = _collapse_into_ranges(list(missing), interval)
 
         for gap in gaps:
-            self._record_gap(exchange, symbol, timeframe, gap)
+            newly_recorded = self._record_gap(exchange, symbol, timeframe, gap)
+            if newly_recorded and self.event_bus is not None:
+                self.event_bus.publish(
+                    GapDetected(
+                        exchange=exchange,
+                        symbol=symbol,
+                        timeframe=timeframe,
+                        gap_start=gap.gap_start.isoformat(),
+                        gap_end=gap.gap_end.isoformat(),
+                    )
+                )
 
         upsert_watermark(self.db, exchange, symbol, timeframe, last_gap_scan_at=now)
 
         return GapDetectionResult(gaps_found=gaps)
 
-    def _record_gap(self, exchange: str, symbol: str, timeframe: str, gap: DetectedGap) -> None:
+    def _record_gap(self, exchange: str, symbol: str, timeframe: str, gap: DetectedGap) -> bool:
+        """Returns True only if this call actually inserted a new
+        ingestion_gap row — False for an already-confirmed-absent gap
+        or an already-pending gap re-detected on a later scan."""
         # confirmed_absent is terminal: don't re-flag a gap the repair
         # service has already given up on (spec 4.8 step 4).
         already_confirmed_absent = self.db.execute(
@@ -106,24 +134,28 @@ class GapDetectionService:
             },
         ).first()
         if already_confirmed_absent:
-            return
+            return False
 
-        self.db.execute(
-            text("""
-                INSERT INTO ingestion_gap
-                    (exchange, symbol, timeframe, gap_start, gap_end, status, detected_at)
-                VALUES (:exchange, :symbol, :timeframe, :gap_start, :gap_end, 'pending', now())
-                ON CONFLICT (exchange, symbol, timeframe, gap_start, gap_end) DO NOTHING
-                """),
-            {
-                "exchange": exchange,
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "gap_start": gap.gap_start,
-                "gap_end": gap.gap_end,
-            },
+        result = cast(
+            CursorResult,
+            self.db.execute(
+                text("""
+                    INSERT INTO ingestion_gap
+                        (exchange, symbol, timeframe, gap_start, gap_end, status, detected_at)
+                    VALUES (:exchange, :symbol, :timeframe, :gap_start, :gap_end, 'pending', now())
+                    ON CONFLICT (exchange, symbol, timeframe, gap_start, gap_end) DO NOTHING
+                    """),
+                {
+                    "exchange": exchange,
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "gap_start": gap.gap_start,
+                    "gap_end": gap.gap_end,
+                },
+            ),
         )
         self.db.commit()
+        return result.rowcount > 0
 
 
 def _collapse_into_ranges(

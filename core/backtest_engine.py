@@ -95,12 +95,30 @@ class BacktestEngine:
         position_sizer: PositionSizer,
         execution_model: ExecutionModel,
         initial_capital: float = 10_000.0,
+        data_quality_ok: bool = True,
+        data_quality_reason: str | None = None,
     ):
+        # data_quality_ok/data_quality_reason (added — docs/gap_audit_report.md
+        # P0 #2): BacktestEngine deliberately takes no db session and
+        # operates purely over a pre-loaded DataFrame (see module
+        # docstring) — querying DataQualityService per bar would add a
+        # live DB round trip to a component designed to avoid exactly
+        # that. Data quality for a symbol/timeframe doesn't change
+        # bar-to-bar within a single backtest anyway; it's a property
+        # of the INGESTED INPUT DATA for this run, knowable once,
+        # up front. The real wiring is: a caller runs
+        # DataQualityService.run(...).passed() ONCE before constructing
+        # this engine and passes the result in — every RiskContext this
+        # run builds then carries a real answer instead of a hardcoded
+        # True. Defaults preserve the old (permissive) behavior for
+        # callers/tests that don't care about this gate.
         self.strategies = strategies
         self.regime_detector = regime_detector
         self.position_sizer = position_sizer
         self.execution_model = execution_model
         self.initial_capital = initial_capital
+        self.data_quality_ok = data_quality_ok
+        self.data_quality_reason = data_quality_reason
         self._required_features = sorted(
             set(
                 REGIME_REQUIRED_FEATURES
@@ -236,12 +254,12 @@ class BacktestEngine:
             feature_window=pending.window,
             regime_state=pending.regime_state,
             portfolio_view=portfolio_view,
-            data_quality_ok=True,
-            data_quality_reason=None,
+            data_quality_ok=self.data_quality_ok,
+            data_quality_reason=self.data_quality_reason,
             as_of=as_of,
         )
 
-    def _process_exits(self, portfolio: Portfolio, row, timestamp) -> None:
+    def _process_exits(self, portfolio: Portfolio, row: pd.Series, timestamp: datetime) -> None:
         for strategy_id in list(portfolio.open_positions.keys()):
             pos = portfolio.open_positions[strategy_id]
             high, low = row["high"], row["low"]
@@ -254,11 +272,15 @@ class BacktestEngine:
                 or (pos.direction < 0 and low <= pos.take_profit)
             )
             if hit_stop:
+                assert pos.stop_loss is not None  # guaranteed by hit_stop above
                 portfolio.close_position(strategy_id, pos.stop_loss, timestamp, "stop_loss")
             elif hit_target:
+                assert pos.take_profit is not None  # guaranteed by hit_target above
                 portfolio.close_position(strategy_id, pos.take_profit, timestamp, "take_profit")
 
-    def _close_all_at_end(self, portfolio: Portfolio, rows) -> None:
+    def _close_all_at_end(
+        self, portfolio: Portfolio, rows: list[tuple[datetime, pd.Series]]
+    ) -> None:
         if portfolio.open_positions and rows:
             last_time, last_row = rows[-1]
             for strategy_id in list(portfolio.open_positions.keys()):

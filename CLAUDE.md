@@ -263,16 +263,24 @@ Signal Explanation Engine (all 9 build-order steps) is built, strictly
 downstream/read-only of everything above it — see the dedicated
 write-up below. The Dashboard UI (all 28 spec sections/build steps) is
 built — see its dedicated write-up below — but **does not include a
-live execution loop or a Strategy Management page**; see "What's NOT
-built yet" for exactly what that means and doesn't mean. A gap audit
-and remediation pass (docs/gap_audit_report.md) closed several silent
-gaps found across every stage above — see "P0/P1 remediation" below
-for the full list. SaaS multi-tenancy is next, not yet started.
+live ORDER EXECUTION loop or a Strategy Management page**; see "What's
+NOT built yet" for exactly what that means and doesn't mean. A gap
+audit and remediation pass (docs/gap_audit_report.md) closed several
+silent gaps found across every stage above — see "P0/P1 remediation"
+and "2026-07-15 remediation" below for the full list. A real,
+continuously-running SIGNAL generation loop (distinct from order
+execution — deliberately signal-only) now exists — see "Signal Bot"
+below. SaaS multi-tenancy is next, not yet started.
 
 ## What's built so far
 - `core/strategy_base.py` — `Signal`, `StrategyMeta`, `StrategyBase`, `Regime`, `VolRegime`
 - `core/strategy_registry.py` — plugin discovery, regime-based filtering
-- `core/confidence_engine.py` — confidence scoring, separate from strategies
+- `core/confidence_engine.py` — confidence scoring, separate from strategies.
+  Found unwired/untested during the 2026-07-15 audit; wired into
+  `core/backtest_engine.py` and given real test coverage the same day
+  — see the 2026-07-15 remediation entry below for the full write-up,
+  including a real design fix made mid-wiring (`evaluate()` no longer
+  owns its own `RegimeDetector`).
 - `core/feature_store.py` — `FeatureRegistry`, `FeatureWindow`, dependency resolution
 - `core/indicators/` — `pandas_ta_adapter.py` (library wrap), `derived.py` (hand-written), `register.py` (default registry)
 - `core/regime_detector.py` + `core/regime_config.py` — rule-based trend/vol regime detection with hysteresis
@@ -512,7 +520,12 @@ for the full list. SaaS multi-tenancy is next, not yet started.
     Binance parameter shapes are real additional scope; external/manual
     trade detection (an exchange order with no matching
     `client_order_id`) is explicitly deferred to Stage 3, confirmed
-    with the user against the spec's own open decision #1;
+    with the user against the spec's own open decision #1 — **found
+    during the 2026-07-15 audit: Stage 3 never actually built this.**
+    Nothing in `core/security/` or `core/execution/` detects or
+    reconciles an exchange order that didn't originate from
+    `OrderManager`. Still an open, unresolved deferral, not a stale
+    note about something later completed elsewhere;
     `SymbolFilterCache` doesn't model `PERCENT_PRICE_BY_SIDE`
     (price-deviation-from-market) — out of the spec's decision #5 scope
     (`LOT_SIZE`/`PRICE_FILTER`/`MIN_NOTIONAL` only), discovered when a
@@ -857,8 +870,9 @@ only here — this section is a pointer, not a duplicate write-up:
   ready" would be actively misleading given the security foundation
   underneath it is deliberately non-production. Flagged here rather
   than silently built or silently dropped.
-- Full test suite in `tests/` — 752 tests collected: 749 passing +
-  3 real-testnet-only as of last run, all against real local Postgres
+- Full test suite in `tests/` — 796 tests collected as of the
+  2026-07-15 remediation below (was 752 at the end of the P0/P1 pass):
+  793 passing + 3 real-testnet-only, all against real local Postgres
   and/or a real local WebSocket server, no mocks; LLM calls faked in
   the standard suite; Binance calls faked in the standard suite except
   the `testnet`-marked integration suite
@@ -880,23 +894,273 @@ only here — this section is a pointer, not a duplicate write-up:
   mechanically safe (type annotations and import fixes only, zero
   behavior change) by re-running the full suite after each fix.
 
+## 2026-07-15 remediation: 3 functional gaps closed
+A follow-up audit the same day found and flagged three additional
+items beyond the P0/P1 list above (`core/confidence_engine.py` unwired/
+untested, external/manual trade detection deferred-but-never-built,
+`is_trading_permitted()` not called from the order path). All three
+are now implemented, tested against real Postgres, and verified — full
+suite run after each one individually, per the same discipline as
+every other stage in this project:
+
+- **`ConfidenceEngine` wired into `BacktestEngine`.** A real design fix
+  was made mid-wiring (rule 9), not a silent deviation: `evaluate()`
+  used to take a `FeatureWindow` and classify regime itself via its own
+  `RegimeDetector` instance — but `RegimeDetector` is explicitly
+  stateful (hysteresis), and a second independent `classify()` call per
+  bar would let `ConfidenceEngine`'s hysteresis state silently diverge
+  from the regime `BacktestEngine` actually used to decide eligibility
+  and generate the signal. Fixed: `evaluate(signal, regime_state)` now
+  takes the already-computed `RegimeState` directly (mirroring
+  `RiskContext`'s existing pattern) — `ConfidenceEngine` no longer owns
+  a `RegimeDetector` at all. `core/signal_performance_store.py`'s
+  `SignalPerformanceStore` is the first real `PerformanceStore`
+  implementation, querying `signal_log` directly (a `vol_regime TEXT`
+  column was added to that table — it only ever carried the trend
+  axis, and `ConfidenceEngine.evaluate()`'s query needs both). Bucket
+  boundaries (`> 0.66` high / `> 0.33` medium / else low) are
+  reproduced as a literal SQL `CASE` copy of
+  `ConfidenceEngine._bucket()`, since a SQL expression can't import a
+  Python staticmethod — flagged in both files' comments as the one
+  place they could silently drift apart. `BacktestEngine.__init__`
+  gained an optional `confidence_engine` param (defaults to `None`,
+  so every existing caller/test is unaffected — `SignalLogEntry`
+  entries just keep `confidence=None` exactly like before this
+  wiring). Real gap this does NOT close, flagged honestly rather than
+  glossed over: nothing in this codebase writes `signal_log.outcome`
+  (or persists `BacktestEngine`'s in-memory `signal_log` to Postgres at
+  all) — so `SignalPerformanceStore` is correct and tested, but has no
+  real historical rows to learn from yet in an actual run. That's a
+  separate, pre-existing gap (nothing populates `signal_log` in
+  production), not something this wiring was asked to fix.
+  `tests/test_confidence_engine.py` (`ConfidenceEngine`'s first-ever
+  test file), `tests/test_signal_performance_store.py`, and new tests
+  in `tests/test_backtest_engine.py` cover this end-to-end.
+
+- **External/manual trade detection.** Deferred from Stage 2 to Stage 3
+  per `docs/execution_engine_stage2_spec.md` decision #1, then never
+  actually built there — closed now.
+  `core/execution/external_trade_detection_service.py`'s
+  `ExternalTradeDetectionService` is the Binance-specific counterpart
+  to `ReconciliationJob` (which is deliberately scoped to OUR OWN
+  tracked orders only): for every symbol this platform has ever traded
+  live, it fetches EVERY exchange-side open order via
+  `BinanceExecutionAdapter.list_open_orders()` (new —
+  `GET /api/v3/openOrders`, added because `ReconciliationJob` never
+  needed to list orders it didn't already know about) and flags any
+  whose `clientOrderId` doesn't match a local live-mode order. New
+  `external_trade_log` table (`schema.sql`), `ON CONFLICT DO NOTHING`
+  keyed on `(exchange, symbol, exchange_order_id)` so a still-open
+  external order re-seen on a later scan doesn't re-publish
+  `ExternalTradeDetected` every cycle — same "only fire on a genuinely
+  new row" discipline as `GapDetectionService`. Wired into
+  `core/ingestion/scheduler.py` as an optional
+  `external_trade_detection_service` param (same additive,
+  `TYPE_CHECKING`-gated pattern as `reconciliation_job` — zero hard
+  runtime dependency for callers that don't pass it), own `is_due()`
+  cadence (300s default). Not wired into `api/main.py`, matching
+  `ReconciliationJob`/`Scheduler` themselves — neither runs inside the
+  dashboard API process; both are meant for the separate long-running
+  `Scheduler` process this project doesn't currently start anywhere
+  (see "no live execution loop" below — the same gap that leaves
+  `Scheduler` itself unstarted in practice).
+
+- **`is_trading_permitted()` enforced in the real order-submission
+  path.** `OrderManager` now takes optional `kill_switch`,
+  `arming_service`, `exchange` constructor params — but "optional" only
+  in the Python-signature sense: **a `mode="live"` `OrderManager`
+  cannot be constructed at all unless all three are supplied** (a
+  `ValueError` at `__init__`, structural rather than best-effort,
+  matching this project's established pattern for high-stakes gates —
+  `MainnetGate`'s `isinstance()` check at the lowest layer, kill
+  switch's "never auto-clears"). `mode="paper"` is completely
+  unaffected — arming/kill-switch were never meant to gate simulated
+  trading. `submit()` calls the new `_enforce_trading_permitted()` for
+  every live order, which calls `is_trading_permitted()` as the single
+  source of truth for the AND decision, then (only on refusal) does one
+  cheap follow-up `kill_switch.is_engaged()` check purely to build a
+  specific, honest `TradingNotPermittedError` message — never
+  re-deriving the dual-gate logic a second time. Closes the precise gap
+  the 2026-07-15 audit found: `RiskEngine`'s own gate layer already
+  checked `KillSwitch` before approving any `SizingDecision` (that half
+  was always real), but `ArmingService.is_armed()` was never checked
+  anywhere in the order path — an unarmed strategy's live order would
+  have gone through. Now both gates are checked at the point of
+  submission itself, not just upstream. The 3 pre-existing test files
+  that construct a live-mode `OrderManager`
+  (`tests/test_execution/test_order_manager_integration.py`,
+  `tests/test_execution/test_reconciliation_job.py`,
+  `tests/test_execution/test_binance_testnet_integration.py`) were all
+  updated to arm their test strategy and supply a dedicated
+  (never-`'global'`) `KillSwitch` scope, so no other test's kill-switch
+  state can ever leak into or out of these. New tests prove both
+  refusal paths (engaged kill switch; unarmed strategy) and the happy
+  path (armed + clear → order actually goes through) in
+  `test_order_manager_integration.py`.
+
+- **What this remediation pass does NOT change**: the "no live
+  execution loop" gap remains exactly as real as it was before — see
+  "What's NOT built yet" below for the precise, updated wording. Wiring
+  `is_trading_permitted()` into `submit()` and giving arming a real
+  enforced effect doesn't create anything that calls `submit()`
+  automatically; it only guarantees that IF something eventually does,
+  it can't bypass either gate. Confirmed as functionally complete for
+  what was asked (docs/gap_audit_report.md-style precision, not
+  overclaiming): full suite run after every one of the three items
+  above individually, `black`/`ruff`/`mypy` clean throughout.
+
+## Signal Bot (2026-07-15) — signal-only, no execution
+Built in direct response to a user request for "a fully functional
+trading bot which also gives me signal of trades," scoped down to
+**signal-only** by explicit user choice (asked directly: auto-execute
+on testnet, paper-auto-execute, or signal-only — user chose
+signal-only). This is deliberately NOT the "live execution loop" gap
+above — see that entry for the precise boundary between the two:
+
+- `core/signals/signal_scanner.py`'s `SignalScanner` is the real,
+  runnable loop that was missing: reads real market data from
+  `raw_ohlcv` (kept fresh by the existing, already-tested ingestion
+  Scheduler — this class does not fetch its own data), classifies
+  regime via `RegimeDetector`, runs every configured strategy, scores
+  confidence via `ConfidenceEngine` when a signal fires, logs every
+  strategy check to `signal_log` (eligible-directional,
+  eligible-flat, and not-eligible — matching `BacktestEngine`'s own
+  "log everything" discipline, and incidentally the FIRST real writer
+  `signal_log` has ever had — every previous read of that table was
+  against hand-seeded test fixtures), and publishes
+  `TradeSignalGenerated` only for a genuinely new directional signal
+  (idempotent via a new `UNIQUE (strategy_id, symbol, bar_time)`
+  constraint on `signal_log` + `ON CONFLICT DO NOTHING`, same
+  discipline as `GapDetectionService`/`ExternalTradeDetectionService`).
+  Structurally incapable of placing an order — never imports
+  `OrderManager`, `RiskEngine`, or any `ExecutionAdapter`.
+- **Real bug found and fixed while wiring this up**:
+  `strategies/ema_cross.py` has always declared `required_features =
+  [..., "ema_20_prev", "ema_50_prev"]`, but neither was ever
+  registered in `core/indicators/register.py` — the real
+  `EMACrossStrategy` would have raised `KeyError` the instant it ran
+  against a real `FeatureRegistry`, and nothing had ever actually done
+  that before (only synthetic hand-built feature DataFrames in
+  `tests/test_backtest_engine.py`, which bypass the registry
+  entirely). Fixed: `core/indicators/derived.py` gained
+  `compute_shifted()` (a generic previous-bar-value helper, trailing
+  by construction), registered as `ema_20_prev`/`ema_50_prev`
+  (`.shift(1)` of `ema_20`/`ema_50`). A new regression test
+  (`test_default_registry_computes_every_real_strategys_required_features`
+  in `tests/test_pandas_ta_adapter.py`) computes each real reference
+  strategy's own `required_features` directly against the default
+  registry, so a future strategy with an unregistered feature fails
+  loudly in CI instead of silently the first time it runs for real.
+- `core/signal_performance_store.py`'s `SignalPerformanceStore` (built
+  in the 2026-07-15 remediation pass above) is what backs the
+  scanner's `ConfidenceEngine` — real historical confidence scoring
+  will start becoming meaningful as `signal_log` accumulates real rows
+  from this bot actually running; on a fresh install it will
+  legitimately report "insufficient history" for a while, which is
+  correct behavior, not a bug.
+- Notification wiring: `TradeSignalGenerated` added to
+  `core/notifications/severity.py` (severity `info`), a new
+  `notify_on_trade_signal` preference (`schema.sql`'s
+  `notification_preferences` table, defaults `TRUE` — this is the
+  feature the toggle exists for) wired into
+  `core/notifications/notification_persister.py`'s
+  `_EMAIL_TOGGLE_BY_EVENT_TYPE`/`_MESSAGE_BUILDERS`. A signal shows up
+  in the dashboard's Notifications page immediately, and by email if
+  SMTP is configured and the toggle is on.
+- `core/ingestion/scheduler.py` gained an optional `signal_scanner`
+  param, same additive/optional pattern as `reconciliation_job`/
+  `external_trade_detection_service` — own `is_due()` cadence (1h
+  default), zero hard dependency on `core.signals` for callers that
+  don't pass it.
+- `scripts/run_signal_bot.py` is the actual runnable entrypoint —
+  registers BTC/USDT 1h on Binance as a tracked instrument, wires up
+  both reference strategies (EMA crossover, RSI mean reversion — user
+  asked for "both, figure out which is more accurate," which is
+  exactly what per-strategy confidence scoring is for), real
+  `NotificationPersister`/`EmailSender`, and runs the `Scheduler`
+  either once (`--once`) or continuously (`run_forever()`). Needs no
+  Binance API credentials — market data (`GET /api/v3/klines`,
+  `GET /api/v3/openOrders` is never called here) is public.
+  **Verified working end-to-end against real Binance data and real
+  Postgres during this build**: a real `--once` run backfilled 77,974
+  real hourly BTC/USDT candles, correctly classified the real current
+  regime as SIDEWAYS/NORMAL_VOL, correctly found `EMACrossStrategy`
+  ineligible for that regime, and correctly evaluated
+  `RSIMeanReversionStrategy` (RSI=58.2, neutral band, no signal) — a
+  real, honest "no signal right now" result against live market
+  conditions, not a fabricated demo.
+- Known, deliberate limitation, documented rather than silently
+  glossed over: `RegimeDetector`'s hysteresis state lives in the
+  scanner's own process memory and does not survive a restart —
+  regime classification starts fresh after any restart, same category
+  of limitation as `RegimeDetector`'s own documented "reset() between
+  runs" contract. Persisting hysteresis across restarts was not part
+  of what was asked for and would be new scope.
+- **Operational gotcha, found running the full suite right after a
+  real bot run**: `tests/ingestion/conftest.py`'s `db` fixture
+  `TRUNCATE`s `raw_ohlcv`/`tracked_instruments` (and the rest of the
+  ingestion tables) in its teardown, for test isolation — a
+  deliberate, pre-existing pattern, not something this build changed.
+  Running `pytest` against the SAME local dev Postgres the bot has
+  been ingesting into will wipe the bot's real backfilled history and
+  its `tracked_instruments` row. Not data-destroying in any lasting
+  sense — the bot just re-backfills from scratch the next time it
+  runs (`scripts/run_signal_bot.py` re-inserts the tracked row via
+  `ON CONFLICT DO UPDATE` and `BackfillService` re-detects "no
+  watermark" the same way it would on a fresh install) — but it does
+  mean a multi-minute wait before the next real signal, and it's why
+  `test_backfill_stores_all_candles_and_completes_watermark`'s
+  unscoped `SELECT count(*) FROM raw_ohlcv` (no exchange/symbol
+  filter) can transiently fail if the suite runs while the bot's real
+  data is still present. Confirmed via a second full-suite run once
+  the collision resolved itself: 805/808 clean.
+- Tests: `tests/test_signals/test_signal_scanner.py` (6 tests, real
+  Postgres, real indicator computation, a deterministic fake strategy
+  — real strategies fire on organic crossovers/RSI extremes that are
+  awkward to force from synthetic data, so the scanner MACHINERY is
+  tested against a controllable fixture rather than depending on real
+  strategies happening to cross on a given synthetic series),
+  `tests/test_notifications/test_notification_persister.py` (3 new
+  `TradeSignalGenerated` tests), `tests/ingestion/test_scheduler.py`
+  (2 new wiring tests), `tests/test_pandas_ta_adapter.py` (1 new
+  regression test for the `ema_20_prev`/`ema_50_prev` fix). Full suite
+  as of this build: 808 tests collected — 805 passing + 3
+  real-testnet-only (skipped, no credentials in this environment) —
+  `black`/`ruff`/`mypy` clean across the entire repository.
+
 ## What's NOT built yet (next up)
-- **No live execution loop exists anywhere in the codebase — this is
-  the single most important gap to understand before assuming anything
-  here is close to trading real money.** Every piece downstream of a
-  signal (Risk Engine, `OrderManager`, `BinanceExecutionAdapter`,
-  `is_trading_permitted()`) is built and tested in isolation, but
-  nothing anywhere actually runs the loop of: discover strategies →
-  classify regime → generate signals → size via Risk Engine → submit
-  via `OrderManager`. Confirmed by direct inspection during the P0/P1
-  remediation pass: `OrderManager.submit()` and
-  `is_trading_permitted()` both have zero callers outside `tests/`.
-  Arming a strategy through the dashboard (`POST
-  /api/risk/arming/arm`) has **zero execution effect** — it is a pure
-  `arming_state` DB upsert; nothing reads that table to decide whether
-  to actually trade. The missing Strategy Management page (below) is a
-  smaller, secondary gap — even with that page built, there would
-  still be nothing for it to arm into actual execution.
+- **No live ORDER EXECUTION loop exists anywhere in the codebase —
+  still true, and still the single most important gap to understand
+  before assuming anything here is close to trading real money.**
+  Precision, updated after `core/signals/signal_scanner.py` shipped
+  (see "Signal Bot" below): a real, continuously-running SIGNAL
+  generation loop now exists and is verified working against real
+  Binance market data — it discovers strategies, classifies regime,
+  and generates signals, on a real schedule, unattended. What still
+  does NOT exist is the second half: nothing sizes a discovered signal
+  via the Risk Engine or calls `OrderManager.submit()` from it. The
+  signal bot is deliberately, structurally incapable of placing an
+  order — it has no reference to `OrderManager`, `RiskEngine`, or any
+  `ExecutionAdapter` at all, confirmed by the module itself never
+  importing them. `OrderManager.submit()` now DOES have real callers
+  (its own test suite, and it structurally enforces the KillSwitch +
+  ArmingService dual gate for every live-mode construction — see the
+  2026-07-15 remediation entry) — the precise claim is that nothing in
+  this codebase ever calls `submit()` automatically, driven by a real
+  signal. Arming a strategy through the dashboard (`POST
+  /api/risk/arming/arm`) now DOES have a real, enforced downstream
+  effect (an unarmed strategy's live order is structurally refused),
+  but there is still no code path that would ever attempt to place one
+  in the first place. Turning the signal bot into an execution bot
+  would mean deliberately closing this gap — a decision with real
+  money implications, not a code change to make silently.
+- No Strategy Management page/API exists in the dashboard (spec never
+  scheduled it — deferred, not silently dropped) — today the only way
+  to register a strategy for testnet execution is direct
+  `StrategyRegistry`/config-level wiring, not anything an operator can
+  do through the UI. Moot in practice until a live ORDER EXECUTION loop
+  (distinct from the signal bot, see above) exists to run a registered
+  strategy at all.
 - No Strategy Management page/API exists in the dashboard (spec never
   scheduled it — deferred, not silently dropped) — today the only way
   to register a strategy for testnet execution is direct
@@ -907,12 +1171,6 @@ only here — this section is a pointer, not a duplicate write-up:
   `KMSClient` for a real cloud provider (AWS KMS / Vault / etc.) —
   deferred since no cloud infrastructure is configured in this project
   yet; confirmed with the user rather than built speculatively
-- `is_trading_permitted()` (the `KillSwitch` + `ArmingService` dual
-  gate) is built and tested in isolation but NOT yet called from
-  `OrderManager`/`RiskEngine`'s actual live order-submission path —
-  the gate exists and works; nothing yet consults it before every live
-  order. Real remaining work, not assumed done (and moot until the live
-  execution loop above exists to call it from)
 - `SymbolFilterCache` doesn't model Binance's `PERCENT_PRICE_BY_SIDE`
   filter (price-deviation-from-market) — only
   `LOT_SIZE`/`PRICE_FILTER`/`MIN_NOTIONAL` per the spec's decision #5;
@@ -960,6 +1218,13 @@ npm run test:e2e             # Playwright — needs backend + Postgres + Vite de
 quality gates, frontend build, full E2E suite) on every push/PR against
 a fresh ephemeral Postgres container — the reproducible source of truth
 for "does this actually pass," not this file's prose.
+
+Signal bot (see "Signal Bot" above — signal-only, never places an
+order; no API credentials needed):
+```bash
+python scripts/run_signal_bot.py            # runs continuously (Ctrl+C to stop)
+python scripts/run_signal_bot.py --once     # one sweep, then exit
+```
 
 ## Working style
 The user (project owner) has zero prior coding experience and is learning

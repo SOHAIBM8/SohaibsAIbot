@@ -25,6 +25,11 @@ class NotificationPreferences:
     notify_on_kill_switch: bool = True
     notify_on_credential_validation_failed: bool = True
     notify_on_drawdown_breach: bool = True
+    # Defaults True (unlike a hazard-alert toggle) — this is the
+    # feature the signal scanner exists for, added when the scanner
+    # itself was built; an operator who never touched preferences
+    # should still see trade signals by default.
+    notify_on_trade_signal: bool = True
     updated_at: datetime | None = None
 
 
@@ -39,7 +44,7 @@ class NotificationPreferencesStore:
                     SELECT account_id, email_enabled, email_address, webhook_enabled,
                            webhook_url, notify_on_kill_switch,
                            notify_on_credential_validation_failed, notify_on_drawdown_breach,
-                           updated_at
+                           notify_on_trade_signal, updated_at
                     FROM notification_preferences WHERE account_id = :account_id
                     """),
                 {"account_id": account_id},
@@ -58,11 +63,11 @@ class NotificationPreferencesStore:
                 INSERT INTO notification_preferences
                     (account_id, email_enabled, email_address, webhook_enabled, webhook_url,
                      notify_on_kill_switch, notify_on_credential_validation_failed,
-                     notify_on_drawdown_breach, updated_at)
+                     notify_on_drawdown_breach, notify_on_trade_signal, updated_at)
                 VALUES
                     (:account_id, :email_enabled, :email_address, :webhook_enabled, :webhook_url,
                      :notify_on_kill_switch, :notify_on_credential_validation_failed,
-                     :notify_on_drawdown_breach, :updated_at)
+                     :notify_on_drawdown_breach, :notify_on_trade_signal, :updated_at)
                 ON CONFLICT (account_id) DO UPDATE SET
                     email_enabled = EXCLUDED.email_enabled,
                     email_address = EXCLUDED.email_address,
@@ -72,6 +77,7 @@ class NotificationPreferencesStore:
                     notify_on_credential_validation_failed =
                         EXCLUDED.notify_on_credential_validation_failed,
                     notify_on_drawdown_breach = EXCLUDED.notify_on_drawdown_breach,
+                    notify_on_trade_signal = EXCLUDED.notify_on_trade_signal,
                     updated_at = EXCLUDED.updated_at
                 """),
             {
@@ -85,6 +91,7 @@ class NotificationPreferencesStore:
                     prefs.notify_on_credential_validation_failed
                 ),
                 "notify_on_drawdown_breach": prefs.notify_on_drawdown_breach,
+                "notify_on_trade_signal": prefs.notify_on_trade_signal,
                 "updated_at": now,
             },
         )

@@ -25,3 +25,15 @@ def compute_atr_percentile(df: pd.DataFrame, window: int = 90) -> pd.Series:
     return atr.rolling(window=window, min_periods=window).apply(
         lambda w: (w <= w.iloc[-1]).mean(), raw=False
     )
+
+
+def compute_shifted(df: pd.DataFrame, source: str, periods: int = 1) -> pd.Series:
+    """Previous-bar value of an already-computed column. Added to
+    close a real gap found while wiring up the signal scanner:
+    strategies/ema_cross.py has always required "ema_20_prev"/
+    "ema_50_prev" (needs both the current and prior bar's EMA values
+    to detect a crossover) but neither was ever registered anywhere —
+    EMACrossStrategy would raise KeyError the first time it ran against
+    a real FeatureRegistry. Trailing-only by construction (.shift() only
+    looks backward), so this carries no lookahead risk."""
+    return df[source].shift(periods)

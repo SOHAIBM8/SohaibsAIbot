@@ -47,6 +47,20 @@ Design notes (rule 9 — gaps in the spec, filled in and flagged here):
    self.account_id in-process — but nothing outside this process could
    ever recover which account an order belonged to without it, and the
    AI assistant's account-scoped daily summary needs exactly that.
+
+5. `kill_switch`/`arming_service`/`exchange` (added — CLAUDE.md "What's
+   NOT built yet": `is_trading_permitted()`, Stage 3's real KillSwitch
+   + ArmingService dual gate, was built and tested in isolation but
+   never actually called from the live order-submission path).
+   Structural, not best-effort, matching this project's established
+   pattern for high-stakes gates (MainnetGate's isinstance() check at
+   the lowest layer, kill switch's "never auto-clears"): a `mode="live"`
+   OrderManager cannot be constructed at all without both `kill_switch`
+   and `arming_service` — there is no code path that produces a live
+   OrderManager capable of silently skipping the check because a caller
+   forgot to wire it. `mode="paper"` is unaffected — arming/kill-switch
+   were never meant to gate simulated trading, and every existing
+   paper-mode caller/test is completely unaffected by this change.
 """
 
 import uuid
@@ -59,7 +73,9 @@ from core.execution.events import OrderCancelled, OrderFilled, OrderSubmitted
 from core.execution.execution_adapter import ExecutionAdapter
 from core.execution.order import Fill, Order, OrderState, OrderType
 from core.ingestion.event_bus import EventBus
+from core.risk.kill_switch import KillSwitch
 from core.risk.risk_decision import SizingDecision
+from core.security.arming_service import ArmingService, is_trading_permitted
 
 # Which cash-tracking table a fill's account effect is applied to,
 # keyed by Order.mode ('paper' | 'live' — the only two values the
@@ -80,6 +96,13 @@ def _account_table(mode: str) -> str:
         ) from None
 
 
+class TradingNotPermittedError(RuntimeError):
+    """Raised by submit() for a live-mode order when the KillSwitch +
+    ArmingService dual gate (is_trading_permitted()) refuses — fail
+    loud, exactly like submit()'s existing SizingDecision guards,
+    never a silent no-op that could look like an order was placed."""
+
+
 class OrderManager:
     def __init__(
         self,
@@ -89,12 +112,26 @@ class OrderManager:
         mode: str,
         account_id: str,
         starting_balance: float | None = None,
+        kill_switch: KillSwitch | None = None,
+        arming_service: ArmingService | None = None,
+        exchange: str | None = None,
     ):
+        if mode == "live" and (kill_switch is None or arming_service is None or not exchange):
+            raise ValueError(
+                "a mode='live' OrderManager requires kill_switch, arming_service, and "
+                "exchange — every live order must pass the KillSwitch + ArmingService "
+                "dual gate (docs/execution_engine_stage2_spec.md, CLAUDE.md "
+                "'is_trading_permitted()' gap), and there is no supported way to "
+                "construct a live OrderManager that skips it"
+            )
         self.execution_adapter = execution_adapter
         self.event_bus = event_bus
         self.db = db_session
         self.mode = mode
         self.account_id = account_id
+        self.kill_switch = kill_switch
+        self.arming_service = arming_service
+        self.exchange = exchange
         self._orders: dict[str, Order] = {}
 
         if starting_balance is not None:
@@ -120,6 +157,8 @@ class OrderManager:
                 "SizingDecision has no risk_decision_id — every order must originate "
                 "from a persisted, risk-engine-approved decision"
             )
+        if self.mode == "live":
+            self._enforce_trading_permitted(strategy_id)
 
         now = datetime.now(UTC)
         order = Order(
@@ -157,6 +196,29 @@ class OrderManager:
             self.handle_fill(fill)
 
         return order
+
+    def _enforce_trading_permitted(self, strategy_id: str) -> None:
+        # __init__ guarantees these are non-None whenever self.mode ==
+        # "live" — asserted, not re-checked, so this stays the single
+        # place that decision is enforced.
+        assert self.kill_switch is not None
+        assert self.arming_service is not None
+        if is_trading_permitted(
+            self.kill_switch, self.arming_service, self.account_id, strategy_id, self.exchange or ""
+        ):
+            return
+        # is_trading_permitted() is the single source of truth for the
+        # dual-gate decision (never re-derived here) — this cheap
+        # follow-up call only builds a specific, honest error message
+        # for whichever gate actually refused.
+        if self.kill_switch.is_engaged():
+            raise TradingNotPermittedError(
+                f"kill switch is engaged — live order for strategy_id={strategy_id!r} refused"
+            )
+        raise TradingNotPermittedError(
+            f"strategy_id={strategy_id!r} is not armed for exchange={self.exchange!r} "
+            f"(account_id={self.account_id!r}) — live order refused"
+        )
 
     def handle_fill(self, fill: Fill) -> None:
         order = self._require_order(fill.client_order_id)

@@ -13,13 +13,12 @@ notification_preferences.email_enabled/email_address were pure storage
 `preferences_store_factory` are both optional and default to None so
 existing callers/tests that only care about the in-app feed are
 unaffected; the dashboard's real lifespan wiring (api/main.py) supplies
-both. Scope: only the three event categories the P0 item explicitly
-named — kill switch, credential validation failure, drawdown breach —
-route to email, matching the three toggles notification_preferences
-already has (notify_on_kill_switch/notify_on_credential_validation_failed/
-notify_on_drawdown_breach). Circuit-breaker and arming-expired events
-stay in-app-feed-only; no toggle exists for them and adding one wasn't
-part of what was asked for here.
+both. Scope: only the event categories with a real
+notification_preferences toggle route to email — kill switch,
+credential validation failure, drawdown breach, and (added when
+core/signals/signal_scanner.py was built) trade signals via
+notify_on_trade_signal. Circuit-breaker and arming-expired events stay
+in-app-feed-only; no toggle exists for them.
 """
 
 from collections.abc import Callable
@@ -45,6 +44,7 @@ _EMAIL_TOGGLE_BY_EVENT_TYPE: dict[str, str] = {
     "EmergencyRevocationTriggered": "notify_on_credential_validation_failed",
     "DrawdownTierChanged": "notify_on_drawdown_breach",
     "DailyLossLimitBreached": "notify_on_drawdown_breach",
+    "TradeSignalGenerated": "notify_on_trade_signal",
 }
 
 # One short, human-readable line per event type, built only from
@@ -75,6 +75,17 @@ _MESSAGE_BUILDERS: dict[str, Callable[[dict], str]] = {
     "CircuitBreakerCleared": lambda p: f"Circuit breaker '{p.get('breaker_name', '?')}' cleared",
     "ArmingExpired": lambda p: (
         f"Arming expired for strategy {p.get('strategy_id', '?')} on {p.get('exchange', '?')}"
+    ),
+    "TradeSignalGenerated": lambda p: (
+        f"{'LONG' if p.get('direction', 0) > 0 else 'SHORT'} signal: "
+        f"{p.get('strategy_id', '?')} on {p.get('symbol', '?')} "
+        f"(strength={p.get('signal_strength', 0.0):.2f}"
+        + (
+            f", confidence={p['confidence']:.2f}"
+            if p.get("confidence") is not None
+            else ", confidence=insufficient history"
+        )
+        + f") — regime={p.get('regime_trend', '?')}/{p.get('regime_vol', '?')}"
     ),
 }
 

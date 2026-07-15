@@ -46,10 +46,12 @@ from core.ingestion.watermark import get_watermark
 if TYPE_CHECKING:
     # Import only for type checking — avoids ingestion (an already-
     # complete, ai_assistant-agnostic component) gaining a hard runtime
-    # dependency on core.ai_assistant/core.execution just to type-hint
-    # optional params.
+    # dependency on core.ai_assistant/core.execution/core.signals just
+    # to type-hint optional params.
     from core.ai_assistant.daily_summary_job import DailySummaryJob
+    from core.execution.external_trade_detection_service import ExternalTradeDetectionService
     from core.execution.reconciliation_job import ReconciliationJob
+    from core.signals.signal_scanner import SignalScanner
 
 logger = structlog.get_logger(__name__)
 
@@ -65,6 +67,8 @@ class SweepSummary:
     gap_repairs_run: list[str] = field(default_factory=list)
     daily_summaries_run: list[str] = field(default_factory=list)
     reconciliations_run: int = 0
+    external_trades_detected: int = 0
+    trade_signals_generated: int = 0
 
 
 class Scheduler:
@@ -76,6 +80,8 @@ class Scheduler:
         event_bus: EventBus | None = None,
         daily_summary_job: "DailySummaryJob | None" = None,
         reconciliation_job: "ReconciliationJob | None" = None,
+        external_trade_detection_service: "ExternalTradeDetectionService | None" = None,
+        signal_scanner: "SignalScanner | None" = None,
     ):
         self.db = db
         self.adapters = adapters
@@ -83,6 +89,8 @@ class Scheduler:
         self.event_bus = event_bus
         self.daily_summary_job = daily_summary_job
         self.reconciliation_job = reconciliation_job
+        self.external_trade_detection_service = external_trade_detection_service
+        self.signal_scanner = signal_scanner
         self._stop = threading.Event()
 
     def run_once(self, now: datetime | None = None) -> SweepSummary:
@@ -154,6 +162,29 @@ class Scheduler:
         if self.reconciliation_job is not None and self.reconciliation_job.is_due(now):
             results = self.reconciliation_job.run_once(now)
             summary.reconciliations_run = len(results)
+
+        # Same is_due()-owns-its-own-cadence pattern as reconciliation_job
+        # above (300s default, configurable) — additive, optional, zero
+        # hard runtime dependency on core.execution for callers that
+        # don't pass this param.
+        if (
+            self.external_trade_detection_service is not None
+            and self.external_trade_detection_service.is_due(now)
+        ):
+            external_results = self.external_trade_detection_service.run_once(now)
+            summary.external_trades_detected = sum(1 for r in external_results if r.newly_recorded)
+
+        # Same is_due()-owns-its-own-cadence pattern (1h default,
+        # configurable) — additive, optional, zero hard runtime
+        # dependency on core.signals for callers that don't pass this
+        # param. Reads raw_ohlcv for whatever (exchange, symbol,
+        # timeframe) it was constructed for; relies on the per-
+        # instrument loop above (or a real ingestion Scheduler run
+        # elsewhere) to keep that data fresh — it does not fetch its
+        # own market data.
+        if self.signal_scanner is not None and self.signal_scanner.is_due(now):
+            signal_results = self.signal_scanner.run_once(now)
+            summary.trade_signals_generated = sum(1 for r in signal_results if r.newly_recorded)
 
         return summary
 

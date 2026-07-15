@@ -60,13 +60,32 @@ CREATE TABLE signal_log (
     strategy_id         TEXT NOT NULL,
     regime              TEXT,
     regime_confidence   NUMERIC,
+    -- Trend and volatility are independent regime axes everywhere else
+    -- in this codebase (core/strategy_base.py's Regime/VolRegime split)
+    -- — `regime` above only ever carried the trend axis. Added so
+    -- core/signal_performance_store.py (ConfidenceEngine's real
+    -- PerformanceStore, wired in to fix CLAUDE.md's "confidence_engine
+    -- has zero callers" gap) can query by BOTH axes, matching
+    -- ConfidenceEngine.evaluate()'s actual query shape — filtering on
+    -- trend alone would silently blend high-vol and low-vol outcomes
+    -- into one win rate.
+    vol_regime          TEXT,
     direction           SMALLINT,
     signal_strength     NUMERIC,
     confidence          NUMERIC,
     reasons             TEXT[],
     rejected_reasons    TEXT[],
     acted_on            BOOLEAN,
-    outcome             JSONB          -- filled in after the fact: pnl, exit_reason
+    outcome             JSONB,         -- filled in after the fact: pnl, exit_reason
+    -- core/signals/signal_scanner.py is the first real writer of this
+    -- table — one row per (strategy, symbol, bar), whether or not the
+    -- strategy was eligible/directional, matching the "log everything"
+    -- discipline core/backtest_engine.py already follows. UNIQUE +
+    -- ON CONFLICT DO NOTHING is what makes a re-run for a bar the
+    -- scanner already processed a safe no-op instead of a duplicate
+    -- row/duplicate notification — same idempotency discipline as
+    -- ingestion_gap/external_trade_log elsewhere in this schema.
+    UNIQUE (strategy_id, symbol, bar_time)
 );
 
 CREATE INDEX idx_signal_log_strategy_regime ON signal_log (strategy_id, regime);
@@ -524,6 +543,27 @@ CREATE TABLE reconciliation_log (
     checked_at                       TIMESTAMPTZ NOT NULL
 );
 
+-- External/manual trade detection (docs/execution_engine_stage2_spec.md
+-- open decision #1 — deferred to Stage 3 there, never actually built;
+-- closed by CLAUDE.md's "What's NOT built yet" remediation pass). An
+-- exchange order with no matching client_order_id in `orders` — this
+-- platform didn't place it. UNIQUE on (exchange, symbol,
+-- exchange_order_id) so a repeated scan across ExternalTradeDetectionService
+-- runs doesn't re-log/re-publish the same still-open external order every
+-- cycle, mirroring ingestion_gap's "ON CONFLICT DO NOTHING, only publish on
+-- a genuinely new row" discipline.
+CREATE TABLE external_trade_log (
+    id                          BIGSERIAL PRIMARY KEY,
+    exchange                    TEXT NOT NULL,
+    symbol                      TEXT NOT NULL,
+    exchange_order_id           TEXT NOT NULL,
+    exchange_client_order_id    TEXT,
+    side                        TEXT,
+    status                      TEXT,
+    detected_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (exchange, symbol, exchange_order_id)
+);
+
 -- =====================================================================
 -- Live Execution Stage 3 (docs/execution_engine_stage3_spec.md) — live
 -- trading security: envelope-encrypted credentials, arming, audit.
@@ -697,5 +737,6 @@ CREATE TABLE notification_preferences (
     notify_on_kill_switch                           BOOLEAN NOT NULL DEFAULT TRUE,
     notify_on_credential_validation_failed            BOOLEAN NOT NULL DEFAULT TRUE,
     notify_on_drawdown_breach                           BOOLEAN NOT NULL DEFAULT TRUE,
+    notify_on_trade_signal                                BOOLEAN NOT NULL DEFAULT TRUE,
     updated_at                                            TIMESTAMPTZ NOT NULL
 );

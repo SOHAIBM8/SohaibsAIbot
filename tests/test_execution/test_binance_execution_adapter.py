@@ -434,3 +434,39 @@ def test_repeated_ambiguous_failures_still_only_produce_one_final_order():
     assert order.exchange_order_id == "55"
     post_calls = [c for c in session.calls if c[0] == "post"]
     assert len(post_calls) == 1
+
+
+# --- list_open_orders (external/manual trade detection) --------------------
+
+
+def test_list_open_orders_returns_the_raw_exchange_response():
+    session = _ScriptedSession()
+    adapter = make_adapter(session)
+    session.script(
+        "get",
+        _FakeResponse(
+            200,
+            json_body=[
+                {"clientOrderId": "co-1", "orderId": 1, "side": "BUY", "status": "NEW"},
+                {"clientOrderId": "co-2", "orderId": 2, "side": "SELL", "status": "NEW"},
+            ],
+        ),
+    )
+
+    orders = adapter.list_open_orders("BTC/USDT")
+
+    assert len(orders) == 2
+    assert orders[0]["clientOrderId"] == "co-1"
+    get_calls = [c for c in session.calls if c[0] == "get"]
+    assert len(get_calls) == 1
+    assert get_calls[0][1].endswith("/api/v3/openOrders")
+    assert get_calls[0][2]["symbol"] == "BTCUSDT"
+
+
+def test_list_open_orders_raises_on_an_error_response():
+    session = _ScriptedSession()
+    adapter = make_adapter(session)
+    session.script("get", _FakeResponse(400, json_body={"code": -1121, "msg": "Invalid symbol."}))
+
+    with pytest.raises(FatalIngestionError):
+        adapter.list_open_orders("BTC/USDT")

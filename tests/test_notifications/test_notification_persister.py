@@ -367,3 +367,116 @@ def test_no_email_attempted_when_persister_has_no_email_sender_configured(db):
 
     results = [r for r in NotificationLogStore(db).list_recent(limit=50) if _MARKER in r.message]
     assert len(results) == 1
+
+
+# --- TradeSignalGenerated (core/signals/signal_scanner.py) ------------------
+
+
+def test_trade_signal_generated_is_persisted_as_info_and_emailed(db, monkeypatch):
+    NotificationPreferencesStore(db).upsert(
+        NotificationPreferences(
+            account_id=_EMAIL_ACCOUNT_ID,
+            email_enabled=True,
+            email_address="ops@example.com",
+            notify_on_trade_signal=True,
+        )
+    )
+    fake_smtp = _FakeSMTPClient("smtp.example.com", 587)
+    bus = FakeEventBus()
+    persister = NotificationPersister(
+        bus,
+        store_factory=lambda: NotificationLogStore(db),
+        preferences_store_factory=lambda: NotificationPreferencesStore(db),
+        email_sender=make_email_sender(fake_smtp, monkeypatch),
+        account_id=_EMAIL_ACCOUNT_ID,
+    )
+    persister.start()
+
+    bus.fire(
+        "TradeSignalGenerated",
+        {
+            "event_type": "TradeSignalGenerated",
+            "strategy_id": f"{_MARKER}_ema_cross",
+            "symbol": "BTC/USDT",
+            "direction": 1,
+            "signal_strength": 0.72,
+            "confidence": 0.55,
+            "regime_trend": "bull_trend",
+            "regime_vol": "normal_vol",
+            # A real "now" timestamp, not a fixed past date — see
+            # test_kill_switch_engaged_event_is_persisted_with_critical_severity's
+            # comment above: list_recent() orders by occurred_at DESC
+            # LIMIT 50, and a shared local dev Postgres accumulates far
+            # more than 50 rows across repeated test runs.
+            "occurred_at": datetime.now(UTC).isoformat(),
+        },
+    )
+
+    results = [
+        r
+        for r in NotificationLogStore(db).list_recent(limit=50)
+        if _MARKER in r.message and r.event_type == "TradeSignalGenerated"
+    ]
+    assert len(results) == 1
+    assert results[0].severity == "info"
+    assert "LONG" in results[0].message
+    assert "BTC/USDT" in results[0].message
+
+    assert len(fake_smtp.sent_messages) == 1
+    assert "TradeSignalGenerated" in fake_smtp.sent_messages[0]["Subject"]
+
+
+def test_trade_signal_generated_not_emailed_when_toggle_off(db, monkeypatch):
+    NotificationPreferencesStore(db).upsert(
+        NotificationPreferences(
+            account_id=_EMAIL_ACCOUNT_ID,
+            email_enabled=True,
+            email_address="ops@example.com",
+            notify_on_trade_signal=False,
+        )
+    )
+    fake_smtp = _FakeSMTPClient("smtp.example.com", 587)
+    bus = FakeEventBus()
+    persister = NotificationPersister(
+        bus,
+        store_factory=lambda: NotificationLogStore(db),
+        preferences_store_factory=lambda: NotificationPreferencesStore(db),
+        email_sender=make_email_sender(fake_smtp, monkeypatch),
+        account_id=_EMAIL_ACCOUNT_ID,
+    )
+    persister.start()
+
+    bus.fire(
+        "TradeSignalGenerated",
+        {
+            "event_type": "TradeSignalGenerated",
+            "strategy_id": f"{_MARKER}_rsi",
+            "symbol": "BTC/USDT",
+            "direction": -1,
+            "signal_strength": 0.4,
+        },
+    )
+
+    assert fake_smtp.sent_messages == []
+
+
+def test_trade_signal_generated_message_reports_insufficient_history_when_confidence_is_none(db):
+    bus = FakeEventBus()
+    persister = NotificationPersister(bus, store_factory=lambda: NotificationLogStore(db))
+    persister.start()
+
+    bus.fire(
+        "TradeSignalGenerated",
+        {
+            "event_type": "TradeSignalGenerated",
+            "strategy_id": f"{_MARKER}_no_history",
+            "symbol": "BTC/USDT",
+            "direction": 1,
+            "signal_strength": 0.5,
+            "confidence": None,
+        },
+    )
+
+    results = [r for r in NotificationLogStore(db).list_recent(limit=50) if _MARKER in r.message]
+    assert len(results) == 1
+    assert "insufficient history" in results[0].message

@@ -25,10 +25,14 @@ from core.execution.execution_adapter import ExecutionAdapter
 from core.execution.order import Fill, Order, OrderState, OrderType
 from core.execution.order_manager import OrderManager
 from core.execution.reconciliation_job import ReconciliationJob
+from core.risk.kill_switch import KillSwitch
 from core.risk.risk_decision import SizingDecision
+from core.security.arming_service import ArmingService
 
 ACCOUNT_ID = "test_recon_account"
 STRATEGY_ID = "test_strategy_recon"
+EXCHANGE = "binance"
+_KILL_SWITCH_SCOPE = f"test_reconciliation_{ACCOUNT_ID}"
 
 
 class FakeExchangeSideAdapter(ExecutionAdapter):
@@ -101,6 +105,10 @@ def db():
             text("DELETE FROM risk_decision_log WHERE strategy_id = :s"), {"s": STRATEGY_ID}
         )
         session.execute(text("DELETE FROM paper_accounts WHERE account_id = :a"), {"a": ACCOUNT_ID})
+        session.execute(text("DELETE FROM arming_state WHERE account_id = :a"), {"a": ACCOUNT_ID})
+        session.execute(
+            text("DELETE FROM kill_switch_state WHERE scope = :s"), {"s": _KILL_SWITCH_SCOPE}
+        )
         session.commit()
         session.close()
 
@@ -108,9 +116,17 @@ def db():
 @pytest.fixture
 def setup(db):
     """A live-mode OrderManager wired to the fake adapter, one order
-    submitted and sitting locally at SUBMITTED."""
+    submitted and sitting locally at SUBMITTED. A live OrderManager now
+    structurally requires the KillSwitch + ArmingService dual gate
+    (CLAUDE.md "is_trading_permitted()" gap) — armed here so this
+    fixture's submit() actually succeeds, same as before that gate
+    existed."""
     adapter = FakeExchangeSideAdapter()
     event_bus = FakeEventBus()
+    arming_service = ArmingService(db)
+    arming_service.arm(
+        ACCOUNT_ID, STRATEGY_ID, EXCHANGE, armed_by="test_reconciliation_job", mainnet=False
+    )
     manager = OrderManager(
         execution_adapter=adapter,
         event_bus=event_bus,
@@ -118,6 +134,9 @@ def setup(db):
         mode="live",
         account_id=ACCOUNT_ID,
         starting_balance=100_000.0,
+        kill_switch=KillSwitch(db, scope=_KILL_SWITCH_SCOPE),
+        arming_service=arming_service,
+        exchange=EXCHANGE,
     )
     decision_id = db.execute(
         text("""

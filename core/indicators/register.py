@@ -28,11 +28,36 @@ def build_default_registry() -> FeatureRegistry:
     )
     registry.register(
         FeatureDefinition(
+            name="ema_20_prev",
+            version="v1",
+            # strategies/ema_cross.py needs both the current and prior
+            # bar's EMA values to detect a crossover — never registered
+            # before, so the real EMACrossStrategy could never actually
+            # run against this registry (found wiring up the signal
+            # scanner, see core/indicators/derived.py's docstring).
+            formula=partial(derived.compute_shifted, source="ema_20", periods=1),
+            parameters={"source": "ema_20", "periods": 1},
+            dependencies=["ema_20"],
+            last_updated=now,
+        )
+    )
+    registry.register(
+        FeatureDefinition(
             name="ema_50",
             version="v1",
             formula=partial(ta_adapter.compute_ema, period=50),
             parameters={"period": 50},
             dependencies=[],
+            last_updated=now,
+        )
+    )
+    registry.register(
+        FeatureDefinition(
+            name="ema_50_prev",
+            version="v1",
+            formula=partial(derived.compute_shifted, source="ema_50", periods=1),
+            parameters={"source": "ema_50", "periods": 1},
+            dependencies=["ema_50"],
             last_updated=now,
         )
     )

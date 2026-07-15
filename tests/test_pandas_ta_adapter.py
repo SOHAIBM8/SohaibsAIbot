@@ -50,3 +50,28 @@ def test_default_registry_computes_all_registered_features(sample_ohlcv):
     for col in ["ema_20", "ema_50", "rsi_14", "atr_14", "macd_line"]:
         assert col in result.columns
         assert result[col].notna().any(), f"{col} is all-NaN — check lookback/period"
+
+
+def test_default_registry_computes_every_real_strategys_required_features(sample_ohlcv):
+    """Regression guard: EMACrossStrategy.required_features included
+    "ema_20_prev"/"ema_50_prev" for a long time without either ever
+    being registered — the real strategy would raise KeyError the
+    first time it ran against a real FeatureRegistry, and nothing
+    caught it because no test ever requested exactly the feature set a
+    real strategy actually declares. This test computes each real
+    reference strategy's own required_features (minus raw OHLC
+    columns, which the registry doesn't compute) directly against the
+    default registry, so a future strategy with an unregistered
+    required feature fails loudly here instead of silently at runtime."""
+    from strategies.ema_cross import EMACrossStrategy
+    from strategies.rsi_mean_reversion import RSIMeanReversionStrategy
+
+    registry = build_default_registry()
+    ohlc = {"open", "high", "low", "close"}
+
+    for strategy_cls in (EMACrossStrategy, RSIMeanReversionStrategy):
+        requested = [f for f in strategy_cls().required_features if f not in ohlc]
+        result = registry.compute(sample_ohlcv, requested)
+        for col in requested:
+            assert col in result.columns
+            assert result[col].notna().any(), f"{col} is all-NaN — check lookback/period"

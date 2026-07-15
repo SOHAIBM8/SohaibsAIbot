@@ -9,13 +9,29 @@ easy to reason about — and so confidence methodology can evolve (start
 with historical win-rate lookups, later add multi-timeframe confirmation,
 drawdown-adjusted scoring, liquidity checks) without touching a single
 strategy implementation.
+
+Wired into `core/backtest_engine.py` (CLAUDE.md "What's NOT built yet" —
+this module previously had zero callers). Design fix made during that
+wiring, not a silent deviation (rule 9): `evaluate()` originally took a
+`FeatureWindow` and classified regime itself via its own
+`RegimeDetector` instance. `RegimeDetector` is explicitly stateful
+(hysteresis) and must be called exactly once per bar in strict
+chronological order — a second, independent `classify()` call here
+would let this engine's hysteresis state silently diverge from the
+regime `BacktestEngine` actually used to decide strategy eligibility
+and generate the signal in the first place, so confidence could end up
+scored against a different regime than the one that produced the
+signal. Fixed by having `evaluate()` accept the already-computed
+`RegimeState` directly — the same value `BacktestEngine` already holds
+for this bar — mirroring how `RiskContext` already carries a
+pre-computed `regime_state` rather than every risk layer re-deriving
+it. `ConfidenceEngine` no longer owns a `RegimeDetector` at all.
 """
 
 from dataclasses import dataclass
 from typing import Protocol
 
-from core.feature_store import FeatureWindow
-from core.regime_detector import RegimeDetector
+from core.regime_detector import RegimeState
 from core.strategy_base import Regime, Signal, VolRegime
 
 
@@ -53,20 +69,16 @@ class ConfidenceEngine:
     def __init__(
         self,
         performance_store: PerformanceStore,
-        regime_detector: RegimeDetector,
         min_sample_size: int = 30,
     ) -> None:
         self.performance_store = performance_store  # historical signal outcomes
-        self.regime_detector = regime_detector
         self.min_sample_size = min_sample_size
 
-    def evaluate(self, signal: Signal, feature_window: FeatureWindow) -> ConfidenceReport:
-        state = self.regime_detector.classify(feature_window)
-
+    def evaluate(self, signal: Signal, regime_state: RegimeState) -> ConfidenceReport:
         history = self.performance_store.query(
             strategy_id=signal.strategy_id,
-            regime=state.trend,
-            vol_regime=state.vol,
+            regime=regime_state.trend,
+            vol_regime=regime_state.vol,
             signal_strength_bucket=self._bucket(signal.signal_strength),
         )
 
@@ -84,14 +96,14 @@ class ConfidenceEngine:
         # drawdown-adjustment and multi-timeframe agreement once there's
         # enough live/backtest data to validate a more complex formula
         # against, rather than guessing at weights now.
-        confidence = history.win_rate * state.trend_confidence
+        confidence = history.win_rate * regime_state.trend_confidence
 
         return ConfidenceReport(
             signal=signal,
             confidence=confidence,
             sample_size=history.sample_size,
             basis=[
-                f"trend={state.trend.value} vol={state.vol.value} "
+                f"trend={regime_state.trend.value} vol={regime_state.vol.value} "
                 f"win_rate={history.win_rate:.2f} n={history.sample_size}"
             ],
             caveats=[],

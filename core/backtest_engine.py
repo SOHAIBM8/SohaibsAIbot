@@ -47,6 +47,7 @@ from datetime import datetime
 
 import pandas as pd
 
+from core.confidence_engine import ConfidenceEngine
 from core.execution_model import ExecutionModel
 from core.feature_store import FeatureWindow
 from core.portfolio import Portfolio, Trade
@@ -69,6 +70,11 @@ class SignalLogEntry:
     reasons: list[str]
     rejected_reasons: list[str]
     acted_on: bool
+    # None when no ConfidenceEngine was supplied (old, still-supported
+    # behavior) OR for the not-eligible-for-regime/flat-signal branches,
+    # which were never real trade candidates to begin with — see
+    # __init__'s confidence_engine docstring for the full wiring.
+    confidence: float | None = None
 
 
 @dataclass
@@ -97,6 +103,7 @@ class BacktestEngine:
         initial_capital: float = 10_000.0,
         data_quality_ok: bool = True,
         data_quality_reason: str | None = None,
+        confidence_engine: ConfidenceEngine | None = None,
     ):
         # data_quality_ok/data_quality_reason (added — docs/gap_audit_report.md
         # P0 #2): BacktestEngine deliberately takes no db session and
@@ -112,6 +119,21 @@ class BacktestEngine:
         # run builds then carries a real answer instead of a hardcoded
         # True. Defaults preserve the old (permissive) behavior for
         # callers/tests that don't care about this gate.
+        #
+        # confidence_engine (added — CLAUDE.md "What's NOT built yet":
+        # core/confidence_engine.py had zero real callers anywhere).
+        # Optional, defaulting to None, for the same reason
+        # data_quality_ok/data_quality_reason default permissively —
+        # existing callers/tests that don't construct a ConfidenceEngine
+        # are completely unaffected; SignalLogEntry.confidence is simply
+        # None for every entry, exactly like before this wiring existed.
+        # Passed in already-constructed rather than built here, matching
+        # every other injected collaborator (position_sizer,
+        # execution_model) — this class still opens no DB session of its
+        # own; a real ConfidenceEngine's PerformanceStore doing its own
+        # query per signal is no different from position_sizer already
+        # being a real, DB-backed RiskEngine in the risk-integration
+        # tests.
         self.strategies = strategies
         self.regime_detector = regime_detector
         self.position_sizer = position_sizer
@@ -119,6 +141,7 @@ class BacktestEngine:
         self.initial_capital = initial_capital
         self.data_quality_ok = data_quality_ok
         self.data_quality_reason = data_quality_reason
+        self.confidence_engine = confidence_engine
         self._required_features = sorted(
             set(
                 REGIME_REQUIRED_FEATURES
@@ -213,6 +236,17 @@ class BacktestEngine:
                         )
                         acted_on = True  # queued, not yet filled
 
+                    confidence = None
+                    if signal.direction != 0 and self.confidence_engine is not None:
+                        # Same regime_state this bar already computed
+                        # above — never re-classified, see
+                        # ConfidenceEngine's own module docstring for
+                        # why that matters (hysteresis state can't
+                        # diverge from what actually drove eligibility).
+                        confidence = self.confidence_engine.evaluate(
+                            signal, regime_state
+                        ).confidence
+
                     signal_log.append(
                         SignalLogEntry(
                             bar_time=timestamp,
@@ -224,6 +258,7 @@ class BacktestEngine:
                             reasons=signal.reasons,
                             rejected_reasons=signal.rejected_reasons,
                             acted_on=acted_on,
+                            confidence=confidence,
                         )
                     )
 

@@ -46,7 +46,9 @@ from core.execution.binance_symbol_filter_cache import SymbolFilterCache
 from core.execution.order import OrderState, OrderType
 from core.execution.order_manager import OrderManager
 from core.execution.reconciliation_job import ReconciliationJob
+from core.risk.kill_switch import KillSwitch
 from core.risk.risk_decision import SizingDecision
+from core.security.arming_service import ArmingService
 from core.security.audit_db import AuditWriterSessionLocal
 from core.security.credential_provider import CredentialProvider
 from core.security.credential_vault import CredentialVault
@@ -57,8 +59,10 @@ TESTNET_REST = "https://testnet.binance.vision"
 TESTNET_WS_API = "wss://ws-api.testnet.binance.vision/ws-api/v3"
 SYMBOL = "BTC/USDT"
 BINANCE_SYMBOL = "BTCUSDT"
+EXCHANGE = "binance"
 ACCOUNT_ID = "testnet_integration_account"
 STRATEGY_ID = "testnet_integration_strategy"
+_KILL_SWITCH_SCOPE = f"test_testnet_integration_{ACCOUNT_ID}"
 
 _HAVE_CREDS = bool(
     os.environ.get("BINANCE_TESTNET_API_KEY") and os.environ.get("BINANCE_TESTNET_API_SECRET")
@@ -114,6 +118,10 @@ def db():
         # is the only one with a row to delete either way.
         session.execute(text("DELETE FROM paper_accounts WHERE account_id = :a"), {"a": ACCOUNT_ID})
         session.execute(text("DELETE FROM live_accounts WHERE account_id = :a"), {"a": ACCOUNT_ID})
+        session.execute(text("DELETE FROM arming_state WHERE account_id = :a"), {"a": ACCOUNT_ID})
+        session.execute(
+            text("DELETE FROM kill_switch_state WHERE scope = :s"), {"s": _KILL_SWITCH_SCOPE}
+        )
         session.commit()
         session.close()
 
@@ -187,6 +195,18 @@ def stack(db, audit_db, vault, credential_id):
         def subscribe(self, event_type, handler):
             pass
 
+    # A live OrderManager now structurally requires the KillSwitch +
+    # ArmingService dual gate (CLAUDE.md "is_trading_permitted()" gap)
+    # — armed here so this suite's real testnet submissions still
+    # succeed, same as before that gate existed.
+    arming_service = ArmingService(db)
+    arming_service.arm(
+        ACCOUNT_ID,
+        STRATEGY_ID,
+        EXCHANGE,
+        armed_by="test_binance_testnet_integration",
+        mainnet=False,
+    )
     manager = OrderManager(
         execution_adapter=adapter,
         event_bus=_NullEventBus(),
@@ -194,6 +214,9 @@ def stack(db, audit_db, vault, credential_id):
         mode="live",
         account_id=ACCOUNT_ID,
         starting_balance=100_000.0,
+        kill_switch=KillSwitch(db, scope=_KILL_SWITCH_SCOPE),
+        arming_service=arming_service,
+        exchange=EXCHANGE,
     )
     return adapter, manager, filter_cache
 

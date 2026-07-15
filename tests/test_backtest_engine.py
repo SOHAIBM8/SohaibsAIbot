@@ -1,7 +1,10 @@
+from dataclasses import dataclass
+
 import pandas as pd
 import pytest
 
 from core.backtest_engine import BacktestEngine
+from core.confidence_engine import ConfidenceEngine
 from core.execution_model import ExecutionModel
 from core.position_sizing import PositionSizer
 from core.regime_config import RegimeDetectorConfig
@@ -283,3 +286,146 @@ def test_two_strategies_hold_independent_concurrent_positions():
     strategy_ids = {t.strategy_id for t in result.trades}
     assert strategy_ids == {"strat_a@1.0.0", "strat_b@1.0.0"}
     assert len(result.trades) == 2
+
+
+# --- ConfidenceEngine wiring (CLAUDE.md "What's NOT built yet") ------------
+
+
+@dataclass
+class _FakeHistory:
+    sample_size: int
+    win_rate: float
+
+
+class _FakePerformanceStore:
+    def __init__(self, history: _FakeHistory):
+        self._history = history
+        self.queries: list[dict] = []
+
+    def query(self, strategy_id, regime, vol_regime, signal_strength_bucket):
+        self.queries.append(
+            {
+                "strategy_id": strategy_id,
+                "regime": regime,
+                "vol_regime": vol_regime,
+                "signal_strength_bucket": signal_strength_bucket,
+            }
+        )
+        return self._history
+
+
+def test_no_confidence_engine_leaves_signal_log_confidence_none():
+    """Old, still-supported behavior: a BacktestEngine constructed
+    without a confidence_engine (every existing caller/test) must
+    produce signal_log entries exactly as before this wiring existed."""
+    df = base_columns(n=6, trigger_bar=1)
+    strategy = make_strategy("no_confidence_probe", "buy_trigger")
+    engine = make_engine([strategy])
+
+    result = engine.run(df)
+
+    acted_entries = [e for e in result.signal_log if e.direction != 0]
+    assert acted_entries  # sanity: the trigger actually fired
+    assert all(e.confidence is None for e in acted_entries)
+
+
+def test_confidence_engine_populates_signal_log_confidence():
+    df = base_columns(n=6, trigger_bar=1)
+    strategy = make_strategy("confidence_probe", "buy_trigger")
+    store = _FakePerformanceStore(_FakeHistory(sample_size=100, win_rate=0.75))
+    confidence_engine = ConfidenceEngine(performance_store=store, min_sample_size=30)
+    engine = BacktestEngine(
+        strategies=[strategy],
+        regime_detector=RegimeDetector(RegimeDetectorConfig(min_confirmation_bars=1)),
+        position_sizer=FixedQuantitySizer(10.0),
+        execution_model=ExecutionModel(fee_bps=0.0, slippage_bps=0.0),
+        initial_capital=10_000.0,
+        confidence_engine=confidence_engine,
+    )
+
+    result = engine.run(df)
+
+    acted_entries = [e for e in result.signal_log if e.direction != 0]
+    assert acted_entries
+    # base_columns' fixed adx_14=10.0 is below the 20.0 trend threshold,
+    # so RegimeDetector reports SIDEWAYS with trend_confidence=0.0 —
+    # confidence = win_rate(0.75) * trend_confidence(0.0) = 0.0 exactly,
+    # per ConfidenceEngine.evaluate()'s own formula.
+    assert all(e.confidence == pytest.approx(0.0) for e in acted_entries)
+    assert store.queries  # the store was actually consulted, not bypassed
+
+
+def test_confidence_engine_query_uses_this_bars_regime_not_a_reclassification():
+    """The whole point of the design fix in core/confidence_engine.py:
+    ConfidenceEngine must be evaluated against the SAME RegimeState
+    BacktestEngine already computed for this bar (SIDEWAYS/NORMAL_VOL
+    per base_columns' fixture), not an independently reclassified one."""
+    df = base_columns(n=6, trigger_bar=1)
+    strategy = make_strategy("regime_probe", "buy_trigger")
+    store = _FakePerformanceStore(_FakeHistory(sample_size=100, win_rate=0.5))
+    confidence_engine = ConfidenceEngine(performance_store=store)
+    engine = BacktestEngine(
+        strategies=[strategy],
+        regime_detector=RegimeDetector(RegimeDetectorConfig(min_confirmation_bars=1)),
+        position_sizer=FixedQuantitySizer(10.0),
+        execution_model=ExecutionModel(fee_bps=0.0, slippage_bps=0.0),
+        initial_capital=10_000.0,
+        confidence_engine=confidence_engine,
+    )
+
+    engine.run(df)
+
+    assert store.queries
+    assert store.queries[0]["regime"] == Regime.SIDEWAYS  # base_columns' fixed adx -> SIDEWAYS
+
+
+def test_confidence_engine_produces_a_real_nonzero_confidence_in_a_trending_regime():
+    """base_columns' fixed adx_14=10.0 always yields trend_confidence
+    0.0 (below threshold), which makes confidence always 0.0 regardless
+    of whether the win_rate*trend_confidence multiplication is actually
+    wired correctly — a bug that always returned 0.0 would pass that
+    test too. This uses a high adx_14 (real BULL_TREND, nonzero
+    trend_confidence) so a genuinely nonzero product is exercised."""
+    df = base_columns(n=6, trigger_bar=1)
+    df["adx_14"] = 35.0  # above the 20.0 threshold -> real trend strength
+    df["ema_20"] = 105.0
+    df["ema_50"] = 100.0  # ema_20 > ema_50 -> BULL_TREND
+    strategy = make_strategy("nonzero_confidence_probe", "buy_trigger", regime=Regime.BULL_TREND)
+    store = _FakePerformanceStore(_FakeHistory(sample_size=100, win_rate=0.8))
+    confidence_engine = ConfidenceEngine(performance_store=store, min_sample_size=30)
+    engine = BacktestEngine(
+        strategies=[strategy],
+        regime_detector=RegimeDetector(RegimeDetectorConfig(min_confirmation_bars=1)),
+        position_sizer=FixedQuantitySizer(10.0),
+        execution_model=ExecutionModel(fee_bps=0.0, slippage_bps=0.0),
+        initial_capital=10_000.0,
+        confidence_engine=confidence_engine,
+    )
+
+    result = engine.run(df)
+
+    acted_entries = [e for e in result.signal_log if e.direction != 0]
+    assert acted_entries
+    # trend_confidence = (35.0 - 20.0) / 30.0 = 0.5 exactly; confidence
+    # = win_rate(0.8) * trend_confidence(0.5) = 0.4
+    assert all(e.confidence == pytest.approx(0.4) for e in acted_entries)
+
+
+def test_confidence_engine_not_consulted_for_flat_or_ineligible_signals():
+    df = base_columns(n=6)  # no trigger_bar set -> every signal stays flat
+    strategy = make_strategy("flat_probe", "buy_trigger")
+    store = _FakePerformanceStore(_FakeHistory(sample_size=100, win_rate=0.5))
+    confidence_engine = ConfidenceEngine(performance_store=store)
+    engine = BacktestEngine(
+        strategies=[strategy],
+        regime_detector=RegimeDetector(RegimeDetectorConfig(min_confirmation_bars=1)),
+        position_sizer=FixedQuantitySizer(10.0),
+        execution_model=ExecutionModel(fee_bps=0.0, slippage_bps=0.0),
+        initial_capital=10_000.0,
+        confidence_engine=confidence_engine,
+    )
+
+    result = engine.run(df)
+
+    assert all(e.confidence is None for e in result.signal_log)
+    assert store.queries == []

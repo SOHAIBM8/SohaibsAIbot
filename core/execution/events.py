@@ -109,3 +109,25 @@ class ExchangeErrorClassified(ExecutionEvent):
     message: str = ""
     occurred_at: datetime | None = None
     event_type: str = "ExchangeErrorClassified"
+
+
+# --- external/manual trade detection (docs/execution_engine_stage2_spec.md
+# open decision #1 — deferred to Stage 3 there, never actually built;
+# closed by CLAUDE.md's "What's NOT built yet" remediation pass) --------
+
+
+@dataclass(frozen=True)
+class ExternalTradeDetected(ExecutionEvent):
+    """An order exists on the exchange with no matching local
+    client_order_id — i.e. one this platform didn't place itself
+    (manual UI action, a different bot/script, or a stale
+    client_order_id this process never generated)."""
+
+    exchange: str = ""
+    symbol: str = ""
+    exchange_order_id: str = ""
+    exchange_client_order_id: str = ""
+    side: str = ""
+    status: str = ""
+    occurred_at: datetime | None = None
+    event_type: str = "ExternalTradeDetected"

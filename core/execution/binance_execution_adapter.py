@@ -259,6 +259,28 @@ class BinanceExecutionAdapter(ExecutionAdapter):
     def get_fills(self, client_order_id: str) -> list[Fill]:
         return list(self._fills.get(client_order_id, []))
 
+    # --- external/manual trade detection (not part of ExecutionAdapter's
+    # generic interface — ReconciliationJob only ever needs get_order_status()
+    # for orders it already knows about; listing EVERY exchange-side open
+    # order, including ones this process never placed, is fundamentally
+    # Binance-specific and has no PaperExecutionAdapter equivalent, since
+    # nothing external can create a paper order) -----------------------
+
+    def list_open_orders(self, symbol: str) -> list[dict]:
+        """Raw GET /api/v3/openOrders response for one symbol — every
+        currently-open order on the exchange, ours or not. Used by
+        ExternalTradeDetectionService to find orders with no matching
+        local client_order_id (docs/execution_engine_stage2_spec.md
+        open decision #1)."""
+        credentials = self._fetch_credentials("binance_execution_adapter.list_open_orders")
+        response = self._signed_request(
+            "GET", "/api/v3/openOrders", {"symbol": _binance_symbol(symbol)}, credentials
+        )
+        if response.status_code >= 400:
+            self._raise_for_error_response(response)
+        result: list[dict] = response.json()
+        return result
+
     # --- order submission internals ---------------------------------
 
     def _send_new_order_once(self, order: Order, credentials: LiveCredentials) -> dict:

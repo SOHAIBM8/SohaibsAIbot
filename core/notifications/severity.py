@@ -22,6 +22,7 @@ NOTIFICATION_EVENT_TYPES = [
     "CircuitBreakerTripped",
     "CircuitBreakerCleared",
     "ArmingExpired",
+    "TradeSignalGenerated",
 ]
 
 SEVERITY_BY_EVENT_TYPE = {
@@ -35,4 +36,7 @@ SEVERITY_BY_EVENT_TYPE = {
     "KillSwitchDisengaged": "info",
     "CircuitBreakerCleared": "info",
     "ArmingExpired": "info",
+    # Informational, not a hazard alert — a signal is an observation
+    # the scanner made, never an order it placed (signal-only mode).
+    "TradeSignalGenerated": "info",
 }
